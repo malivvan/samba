@@ -22,6 +22,16 @@ resource limits and the panic guards are one Go codebase everywhere.
 - **`pkg/watch`** — inotify on Linux, kqueue on macOS and the BSDs,
   `ReadDirectoryChangesW` on Windows, and a polling watcher where none of those
   exists. The inotify decoder also moved here.
+- **A watch is registered before the client is told it is pending.** The
+  notifier used to take its instructions on its own goroutine, so the watch could
+  be installed *after* the interim `STATUS_PENDING` response had gone out — a
+  window in which a client that pended a CHANGE_NOTIFY and immediately changed
+  the file lost the change, and the pending operation then never completed at all
+  (only a CANCEL or a disconnect could end it). Registration now happens on the
+  connection's goroutine, during request processing, which is ordered before the
+  response is written. The same change makes completion deterministic for a
+  cancel that races an event, and makes `TestServerChangeNotify` deterministic
+  instead of relying on the notifier being scheduled in time.
 - **`pkg/rangelock`** — an in-process registry that is authoritative for SMB's
   per-handle semantics on every platform, with the kernel's own lock on top
   where the platform has a per-handle kind (OFD locks on Linux, `LockFileEx` on
@@ -30,7 +40,12 @@ resource limits and the panic guards are one Go codebase everywhere.
 - **`pkg/zerocopy`** — `splice(2)` on Linux, `sendfile(2)` on macOS and the
   BSDs, a bounded buffered copy on Windows, plus a fallback to the buffered path
   when a host filters the syscall (a seccomp container) — counted, so the
-  downgrade is visible.
+  downgrade is visible. The sendfile path's accounting is kept apart from the
+  syscall (`pumpChunks`) precisely so it can be tested everywhere: macOS and the
+  BSDs report a partial send *together with* `EAGAIN`, and a loop that counted
+  only the clean successes would desynchronize the offset and hand the client a
+  response with duplicate bytes in it. Fatal errors are never counted, because
+  their out-length may still hold the count that went in.
 - **`pkg/fsutil`** — portable file metadata, timestamps, filesystem sizes and
   read-ahead hints, including the platforms where each is unavailable
   (`statvfs` on NetBSD, `SetFileTime` and `FILE_FS_SIZE_INFORMATION` on Windows,
@@ -215,7 +230,9 @@ timeout/panic/reconnect paths, and the CLI.
   vetted, tests included, for the BSDs and the other architectures). The
   `continue-on-error` on the non-Linux legs went away with the port — see the
   entry above for what runs where now, and why the BSDs are compile-verified
-  only.
+  only. A `.gitattributes` now stores every text file with LF, which is what keeps
+  the formatting gate (`gofmt -l .`, a byte comparison) meaningful on a Windows
+  checkout instead of reporting every file in the tree.
 - **A release is gated.** `release` runs only on a `v*` tag and needs `lint`,
   `coverage`, `test`, `platform`, `cross-build` and `fuzz`, so it is skipped
   rather than published when any of them fails. It builds both static binaries, smoke-tests `--version` and

@@ -104,6 +104,15 @@ jobs:
       matrix:
         os: [macos-latest, windows-latest]
     steps:
+      # The repository stores every text file with LF (.gitattributes), because
+      # gofmt compares bytes and a CRLF checkout would report every Go file as
+      # unformatted — which is exactly what the Windows runner's core.autocrlf
+      # does. The attribute file is what fixes this for a checkout of any kind;
+      # this step pins the same policy for this job so the gate below cannot
+      # depend on the order Git happened to read the attributes in.
+      - name: Store text files with LF
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:

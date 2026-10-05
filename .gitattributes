@@ -1,0 +1,12 @@
+# Line endings.
+#
+# Every text file is stored and checked out with LF, on every platform. Without
+# this, a Windows checkout converts them to CRLF (the GitHub Windows runners have
+# core.autocrlf=true), and the formatting gate — `gofmt -l .` — then reports every
+# Go file in the tree, because gofmt compares bytes. The CI job that runs that gate
+# on Windows also pins this for itself (see .github/workflows/ci.yml); this file is
+# what protects every other Windows checkout, including a contributor's.
+#
+# `text=auto` means Git decides by content, so a binary file added later is left
+# alone without an entry here.
+* text=auto eol=lf

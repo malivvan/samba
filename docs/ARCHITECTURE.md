@@ -30,7 +30,13 @@ touch another connection's state:
   deferred queue.
 - **notifier** — owns the connection's directory watcher and its watches, and
   translates the platform's change events into queued CHANGE_NOTIFY
-  completions.
+  completions. Registration is *not* on this goroutine: the connection's own
+  goroutine registers the watch while it processes the request, because the
+  interim `STATUS_PENDING` response is written after processing — so the
+  directory is being watched before the client is told the operation is pending,
+  and a client that pends a notification and immediately changes the file cannot
+  miss the change. The notifier goroutine only consumes events, and it never
+  writes to the socket.
 
 Workers share three things through the immutable-ish `Srv` context:
 

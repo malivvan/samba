@@ -181,6 +181,13 @@ func (w *windowsWatcher) Close() error {
 			watches = append(watches, wp)
 		}
 		w.byKey = make(map[uintptr]*winWatch)
+		// The cancelled watches are retired rather than dropped: each one owns a
+		// buffer the kernel may still be writing a cancelled transfer into, so
+		// the memory has to stay reachable until its completion has been
+		// retrieved. The loop holds them until it has drained the port.
+		for _, wp := range watches {
+			w.retired[uintptr(wp.id)] = wp
+		}
 		w.mu.Unlock()
 		close(w.stop)
 		for _, wp := range watches {
@@ -216,7 +223,13 @@ func (w *windowsWatcher) loop(iocp windows.Handle) {
 		)
 		err := windows.GetQueuedCompletionStatus(iocp, &bytesRead, &key, &overlapped, windows.INFINITE)
 		if overlapped == nil {
-			// The shutdown packet posted by Close.
+			// The shutdown packet posted by Close. Every cancelled transfer's
+			// completion is queued by now, so drain the rest before letting the
+			// buffers go: a packet left in the port would otherwise be retrieved
+			// by nobody, and the kernel would write into memory nothing
+			// references any more. A zero timeout makes an empty port the end of
+			// the drain.
+			w.drain(iocp)
 			return
 		}
 		w.mu.Lock()
@@ -259,6 +272,36 @@ func (w *windowsWatcher) loop(iocp windows.Handle) {
 			w.forget(wp)
 			w.send(Notification{ID: wp.id, Gone: true})
 		}
+	}
+}
+
+// drain retrieves whatever completions are still queued, discarding them: it is
+// called once the watcher is shutting down, when every watch has been cancelled
+// and no packet can mean anything any more. It returns when the port is empty.
+func (w *windowsWatcher) drain(iocp windows.Handle) {
+	for {
+		var (
+			bytesRead  uint32
+			key        uintptr
+			overlapped *windows.Overlapped
+		)
+		// A zero timeout turns the wait into a poll: ERROR_TIMEOUT means there is
+		// nothing left.
+		err := windows.GetQueuedCompletionStatus(iocp, &bytesRead, &key, &overlapped, 0)
+		if overlapped == nil && err != nil {
+			return
+		}
+		w.discard(key)
+	}
+}
+
+// discard drops a retired watch whose completion has now been retrieved, which
+// releases the buffer the kernel was writing into.
+func (w *windowsWatcher) discard(key uintptr) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.byKey[key] == nil {
+		delete(w.retired, key)
 	}
 }
 

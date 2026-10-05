@@ -129,9 +129,10 @@ func TestNotifierCompleteAndUnknown(t *testing.T) {
 	}
 
 	// Register, then complete explicitly: the completion is queued with the
-	// requested status.
+	// requested status. No waiting is needed between the two — registration
+	// happens on the caller's goroutine, before the interim response would be
+	// written — so this also fails if that ever stops being true.
 	n.add(&NotifyPend{AsyncID: 5, Path: dir, OutLen: 64, Meta: AsyncMeta{AsyncID: 5}})
-	time.Sleep(100 * time.Millisecond)
 	n.complete(NotifyDone{AsyncID: 5, Status: StatusCancelled})
 	if fired := waitFired(t, c, 5*time.Second); fired.status != StatusCancelled {
 		t.Fatalf("status = %#x, want CANCELLED", fired.status)
@@ -151,8 +152,9 @@ func TestNotifierSharesOneWatchForOneDirectory(t *testing.T) {
 	for _, aid := range []uint64{11, 22} {
 		n.add(&NotifyPend{AsyncID: aid, Path: dir, OutLen: 4096, Meta: AsyncMeta{AsyncID: aid}})
 	}
-	// Let both registrations land, then complete one of them.
-	time.Sleep(100 * time.Millisecond)
+	// Complete one of the two: registration is synchronous, so the first pend is
+	// already registered and its completion is queued by the time complete
+	// returns.
 	n.complete(NotifyDone{AsyncID: 11, Status: StatusCancelled})
 	if fired := waitFired(t, c, 5*time.Second); fired.pend.AsyncID != 11 {
 		t.Fatalf("completion is for %d, want 11", fired.pend.AsyncID)

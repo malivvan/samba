@@ -161,7 +161,7 @@ degradation where it is not, never a fallback that pretends.
 | Shared listening port | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ~ one shared listener ⁽¹⁾ |
 | Directory change notification | ✓ `inotify` | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `ReadDirectoryChangesW` ⁽³⁾ |
 | Byte-range locking | ✓ OFD locks ⁽⁴⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ✓ `LockFileEx` ⁽⁴⁾ |
-| File → socket | ✓ `splice(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ~ buffered copy ⁽⁶⁾ |
+| File → socket | ✓ `splice(2)` | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ~ buffered copy ⁽⁶⁾ |
 | File metadata | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `GetFileInformationByHandle` ⁽⁷⁾ |
 | Timestamps | ✓ `utimensat(2)`, ns | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `SetFileTime`, 100 ns |
 | Filesystem size | ✓ `fstatfs` | ✓ `fstatfs` | ✓ `fstatfs` | ✓ `fstatfs` | ✓ `statvfs` | ✓ `fstatfs` | ✓ `FILE_FS_SIZE_INFORMATION` |
@@ -260,6 +260,20 @@ these are the consequences worth knowing before deploying:
   platform's call cannot be reached without `unsafe` (macOS `F_RDADVISE` takes a
   struct pointer) or does not exist. Nothing about the data a client receives
   changes; the kernel's own readahead still applies.
+- ⁽¹⁰⁾ **On macOS and the BSDs, `sendfile(2)` reports a partial send together
+  with the error.** A non-blocking `sendfile` queues what fits into the socket
+  buffer and answers `EAGAIN` for the rest, with the out-length set to what it
+  queued — unlike Linux and Solaris, which answer `(0, EAGAIN)` and nothing else.
+  That is handled (the partial count is what the transfer's offset advances by),
+  and it is worth knowing because the bug it prevents is silent: counting only
+  the clean successes desynchronizes the offset and the client receives a
+  response with duplicate bytes in it. Two related quirks are handled the same
+  way: `sendfile` can also answer `EAGAIN` having sent *everything* it was asked
+  for, and a *fatal* error may leave the length untouched, so its value is never
+  believed. One consequence cannot be engineered around: XNU's `sendfile`
+  allocates mbufs before it checks the non-blocking flag, so under mbuf pressure
+  the call can park inside the kernel and the stall deadline cannot preempt it —
+  it resumes once the allocation succeeds.
 - **Creation time is synthesized from the modification time** on every platform:
   SMB has a creation time and no portable way to read one, so `mtime` is
   reported. Live with it or fix it per platform — it is not a platform
