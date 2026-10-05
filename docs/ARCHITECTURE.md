@@ -13,7 +13,8 @@ main
  │  interfaces, session registry, lease table, per-worker break mailboxes)
  └─ start N workers (default: one per CPU core)
      each worker:
-       own listening socket (SO_REUSEPORT → the kernel load-balances accepts)
+       own listening socket, or a shared one where the platform cannot bind the
+       address more than once (SO_REUSEPORT → the kernel balances the accepts)
        own accept loop goroutine
        own break-mailbox goroutine
        a table of connections, slot-indexed and generation-tagged
@@ -27,8 +28,9 @@ touch another connection's state:
 - **driver** — the only writer to the socket. It processes frames in batches,
   writes the batched responses, serves zero-copy read plans, and drains the
   deferred queue.
-- **notifier** — owns the connection's inotify instance and its watches, and
-  translates kernel events into queued CHANGE_NOTIFY completions.
+- **notifier** — owns the connection's directory watcher and its watches, and
+  translates the platform's change events into queued CHANGE_NOTIFY
+  completions.
 
 Workers share three things through the immutable-ish `Srv` context:
 
@@ -94,16 +96,55 @@ slot, drops its session channels (tearing a session down when its last channel
 goes, closing that session's remaining handles), hands back its memory
 reservation and connection slot, and recycles the slot.
 
+## The platform layer (`pkg/`)
+
+Four things the server needs are the operating system's, not Go's: sharing a
+listening port between workers, watching a directory for changes, locking a byte
+range, and moving file bytes to a socket. Each lives in its own package under
+`pkg/`, with one implementation per mechanism and a real fallback for the
+platforms that have none:
+
+| Package | Interface the rest of the server sees | Mechanisms |
+|---|---|---|
+| `pkg/reuseport` | `Listeners(n, network, addr)` → the sockets the workers share | `SO_REUSEPORT`, or one shared socket |
+| `pkg/watch` | `Add`/`Remove`/`Events`: one ID per watched directory, batched notifications | inotify, kqueue, ReadDirectoryChangesW, polling |
+| `pkg/rangelock` | `Lock(f, off, len, kind, writeAccess)` | the in-process registry, plus OFD locks or `LockFileEx` where they exist |
+| `pkg/zerocopy` | `Send(conn, file, off, n, stall)` | `splice(2)`, `sendfile(2)`, buffered copy |
+| `pkg/fsutil` | file metadata, timestamps, filesystem sizes, open flags | the platform's own calls, or `ErrUnsupported` |
+
+The boundary is drawn deliberately: **nothing above this layer knows which
+platform it is on.** There are no build tags outside `pkg/`, the protocol code
+has one implementation everywhere, and the only platform-dependent values that
+reach the surface are the ones `introspect.go` publishes (`PlatformFacilities`,
+`PlatformName`), which the CLI prints. That is what keeps a platform from
+silently getting a weaker protocol: signing, encryption and preauth integrity
+cannot regress per platform, because there is nothing per-platform about them.
+
+The layer also decides *what the host can enforce*. Locks are authoritative in
+the server's own registry, so SMB clients always see conflicts; the kernel's own
+lock is taken on top where it exists, which is what makes a lock visible to a
+local process on Linux and Windows but not on macOS and the BSDs. Directory
+notifications carry the changed entry's name where the mechanism reports one
+(inotify, ReadDirectoryChangesW, polling) and the "re-enumerate" answer where it
+cannot (kqueue). Both differences are in the README support table.
+
 ## Zero-copy READ path
 
 A standalone (non-compound) READ of at least 8 KiB whose response does not need
-to be signed or encrypted never puts the file's bytes in userspace:
+to be signed or encrypted does not copy the file's bytes through the server's own
+memory where the platform allows it. The mechanism is the platform's
+([pkg/zerocopy](../pkg/zerocopy), see the README support table): on Linux
 
 ```
 1. write the SMB2 response header
 2. splice(file → pipe, at an explicit offset)   ┐
 3. splice(pipe → socket)                        ┘ repeated until done
 ```
+
+on macOS and the BSDs the same two steps are one `sendfile(2)`, and on Windows
+the bytes go through a bounded buffer because `TransmitFile` cannot take an
+explicit offset. All three satisfy the same contract, which is what the caller
+sees and what `pkg/zerocopy`'s tests enforce on every platform.
 
 Two details are load-bearing:
 
@@ -116,14 +157,20 @@ Two details are load-bearing:
   variant that Go's `io.Copy` reaches for use, and advance, a file descriptor's
   own position. That is unusable here: SMB reads are addressed by offset, and
   one handle can be read concurrently from several channels of a session, so
-  `zerocopy.go` calls splice with a non-NULL offset pointer instead. See
+  every path in `pkg/zerocopy` passes an explicit offset (or reads positionally)
+  and none of them touches the descriptor's position. See
   [PORTING.md](PORTING.md) for the bug this replaced.
 - **Waiting for the socket is bounded.** The socket is non-blocking; when it is
-  full the pump polls for writability with a short timeout and re-checks whether
-  the connection is shutting down, so a stalled peer cannot wedge teardown.
+  full the kernel paths poll for writability with a short timeout and re-check
+  whether the connection is shutting down, and the buffered path uses a write
+  deadline, so a stalled peer cannot wedge teardown. Every path gives up after
+  the same stall budget, and reports it the same way.
 
 The pipe is sized to the advertised `MaxReadSize` where the kernel allows it, so
-one read usually moves in a single splice. The response header is written
+one read usually moves in a single splice. A kernel that cannot do the transfer
+at all — a seccomp filter that blocks `splice(2)`, a host out of descriptors for
+the pipe — falls back to the buffered copy rather than failing the read, and
+counts it, so `--list-platform` can show that the fast path is not being taken. The response header is written
 *before* the payload, which is only sound because the byte count is known up
 front: the header is built from the requested length, clamped to the file size
 (everything past EOF is an `STATUS_END_OF_FILE` error response *instead of* a

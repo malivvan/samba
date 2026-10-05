@@ -34,6 +34,39 @@ func field(t *testing.T, report, name string) string {
 	return ""
 }
 
+// TestListPlatform checks that the platform report is wired through the CLI and
+// carries every mechanism the library reports, including the ones this platform
+// falls back on — a report that only listed the native mechanisms would hide
+// exactly the case it exists for.
+func TestListPlatform(t *testing.T) {
+	code, out, errOut := runCLI(t, "--list-platform")
+	if code != 0 {
+		t.Fatalf("--list-platform exit = %d, stderr %q", code, errOut)
+	}
+	if !strings.Contains(out, samba.PlatformName()) {
+		t.Errorf("--list-platform does not name the platform (%s):\n%s", samba.PlatformName(), out)
+	}
+	for _, f := range samba.PlatformFacilities() {
+		if !strings.Contains(out, f.Name) {
+			t.Errorf("--list-platform omits %q:\n%s", f.Name, out)
+		}
+		if !strings.Contains(out, f.Detail) {
+			t.Errorf("--list-platform omits the detail %q of %q:\n%s", f.Detail, f.Name, out)
+		}
+		how := "native"
+		if !f.Native {
+			how = "fallback"
+		}
+		if !strings.Contains(out, how) {
+			t.Errorf("--list-platform does not say %q is a %s mechanism:\n%s", f.Name, how, out)
+		}
+	}
+	// The report must not read as an error: it exits cleanly.
+	if errOut != "" {
+		t.Errorf("--list-platform wrote to stderr: %q", errOut)
+	}
+}
+
 func TestHelp(t *testing.T) {
 	for _, args := range [][]string{{"--help"}, {"-h"}} {
 		code, out, errOut := runCLI(t, args...)
@@ -44,7 +77,7 @@ func TestHelp(t *testing.T) {
 		// place a user learns about --dump-config or --list-interfaces.
 		for _, want := range []string{
 			"usage: samba", "--config", "--check", "--dump-config",
-			"--list-dialects", "--list-ciphers", "--list-interfaces",
+			"--list-dialects", "--list-ciphers", "--list-interfaces", "--list-platform",
 			"--log-level", "--listen", "--workers", "--version", "--help",
 			"SIGINT", "Exit status",
 		} {

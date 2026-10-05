@@ -1,12 +1,16 @@
 package samba
 
 import (
+	"errors"
 	"io"
 	"os"
 	"strings"
+	"syscall"
+	"time"
 	"unicode/utf8"
 
-	"golang.org/x/sys/unix"
+	"github.com/malivvan/samba/pkg/fsutil"
+	"github.com/malivvan/samba/pkg/rangelock"
 )
 
 // SMB2 command handlers.
@@ -1200,7 +1204,7 @@ func create(
 			}
 			action = createActionCreated
 		}
-		f, err = openRaw(path, os.O_RDONLY|unix.O_DIRECTORY, 0)
+		f, err = openRaw(path, os.O_RDONLY|fsutil.DirOpenFlags, 0)
 		if err != nil {
 			errResp(tx, h, statusFromErr(err), chain)
 			return
@@ -1233,7 +1237,7 @@ func create(
 				action = createActionOverwritten
 			}
 			isDir, writable = false, tryRW
-		case errnoOf(err) == unix.EACCES && tryRW && !wantsWrite:
+		case errnoOf(err) == syscall.EACCES && tryRW && !wantsWrite:
 			// MAXIMUM_ALLOWED fallback: retry read-only.
 			f, err = openRaw(path, (flags&^os.O_RDWR)|os.O_RDONLY, 0)
 			if err != nil {
@@ -1255,7 +1259,7 @@ func create(
 	}
 	// Prefetch hint for streamed file reads (helps cold-storage throughput).
 	if !isDir {
-		adviseSequential(f)
+		fsutil.AdviseSequential(f)
 	}
 	leaf := rel[strings.LastIndex(rel, `\`)+1:]
 	attrs := finalizeAttrs(meta.Attrs, leaf)
@@ -2093,7 +2097,7 @@ func fsInfo(srv *Srv, of *OpenFile, class uint8, b *Writer) uint32 {
 		b.U8(0)
 		b.Bytes8(label)
 	case 3: // FileFsSizeInformation
-		total, avail, _, spu, bps, err := fsSizes(of.File)
+		total, avail, _, spu, bps, err := fsutil.Sizes(of.File, of.Path)
 		if err != nil {
 			return statusFromErr(err)
 		}
@@ -2111,7 +2115,7 @@ func fsInfo(srv *Srv, of *OpenFile, class uint8, b *Writer) uint32 {
 		b.U32(uint32(len(name)))
 		b.Bytes8(name)
 	case 7: // FileFsFullSizeInformation
-		total, avail, free, spu, bps, err := fsSizes(of.File)
+		total, avail, free, spu, bps, err := fsutil.Sizes(of.File, of.Path)
 		if err != nil {
 			return statusFromErr(err)
 		}
@@ -2234,25 +2238,59 @@ func setBasicInfo(of *OpenFile, data []byte) uint32 {
 	if _, ok := r.U32(); !ok { // attributes
 		return StatusInvalidParameter
 	}
-	times := [2]unix.Timespec{filetimeToTimespec(at), filetimeToTimespec(mt)}
-	if err := unix.UtimesNanoAt(int(of.File.Fd()), "", times[:], unix.AT_EMPTY_PATH); err != nil {
+	if err := fsutil.SetTimes(of.File, fsutil.Times{
+		Atime:     filetimeToTime(at),
+		Mtime:     filetimeToTime(mt),
+		OmitAtime: omitted(at),
+		OmitMtime: omitted(mt),
+	}); err != nil {
+		if errors.Is(err, fsutil.ErrUnsupported) {
+			return StatusNotSupported
+		}
 		// Attribute-only updates (archive bit and friends) succeed as a no-op.
 		e := errnoOf(err)
-		if e != unix.EACCES && e != unix.EPERM {
+		if e != syscall.EACCES && e != syscall.EPERM {
 			return StatusFromErrno(e)
 		}
 	}
 	return StatusSuccess
 }
 
-// filetimeToTimespec converts a Windows FILETIME to a timespec, using
-// UTIME_OMIT for the 0 / all-ones sentinels that mean "leave unchanged".
-func filetimeToTimespec(ft uint64) unix.Timespec {
-	if ft == 0 || ft == ^uint64(0) {
-		return unix.Timespec{Sec: 0, Nsec: unix.UTIME_OMIT}
+// omitted reports the 0 / all-ones FILETIME sentinel that means "leave this
+// timestamp unchanged" — the value SET_INFO uses to update one timestamp without
+// touching the other.
+func omitted(ft uint64) bool { return ft == 0 || ft == ^uint64(0) }
+
+// filetimeToTime converts a Windows FILETIME into a Go time. The omitted
+// sentinels map to the zero time; the caller marks those timestamps as omitted,
+// so the value itself is never used.
+func filetimeToTime(ft uint64) time.Time {
+	if omitted(ft) {
+		return time.Time{}
 	}
 	unix100 := int64(ft) - epochDeltaSecs*10_000_000
-	return unix.Timespec{Sec: unix100 / 10_000_000, Nsec: (unix100 % 10_000_000) * 100}
+	return time.Unix(unix100/10_000_000, (unix100%10_000_000)*100)
+}
+
+// lockStatus maps a lock failure onto the protocol status.
+//
+// The package's own errors are checked first, because they are precise: a range
+// another handle holds, a handle that was not opened for writing, and the
+// registry's bound each have their own answer. A conflict arriving from the
+// kernel is already translated to ErrNotGranted where the lock is taken, so what
+// is left here is the kernel's own complaint — a descriptor the lock cannot be
+// taken through, say — which is mapped the way every other errno is.
+func lockStatus(err error) uint32 {
+	switch {
+	case errors.Is(err, rangelock.ErrNotGranted):
+		return StatusLockNotGranted
+	case errors.Is(err, rangelock.ErrNoWriteAccess):
+		return StatusAccessDenied
+	case errors.Is(err, rangelock.ErrTooMany):
+		return StatusInsufficientResources
+	default:
+		return StatusFromErrno(errnoOf(err))
+	}
 }
 
 func setDisposition(of *OpenFile, data []byte) uint32 {
@@ -2391,40 +2429,44 @@ func lockRange(sess *Session, h *ReqHdr, body []byte, chain *Chain, tx *Writer) 
 	// Batch semantics: all-or-nothing. Locks taken earlier in this request are
 	// unwound if a later element conflicts. Blocking waits degrade to immediate
 	// failure (clients retry).
+	//
+	// An exclusive lock needs a handle opened for writing. Linux enforces that in
+	// the kernel; Windows does not, so it is enforced here, from the handle's own
+	// record, and every platform then answers the same way.
 	type applied struct{ off, length uint64 }
 	var done []applied
 	fail := uint32(StatusSuccess)
 	for _, e := range elems {
-		var res error
+		var (
+			res  error
+			kind rangelock.Kind
+		)
 		switch {
 		case e.flags&lockFlagUnlock != 0:
-			res = rangeLock(of.File, e.off, e.length, LockUnlock)
+			kind = rangelock.Unlock
 		case e.flags&lockFlagExclusive != 0:
-			res = rangeLock(of.File, e.off, e.length, LockExclusive)
+			kind = rangelock.Exclusive
 		case e.flags&lockFlagShared != 0:
-			res = rangeLock(of.File, e.off, e.length, LockShared)
+			kind = rangelock.Shared
 		default:
 			fail = StatusInvalidParameter
 		}
 		if fail != StatusSuccess {
 			break
 		}
+		res = rangelock.Lock(of.File, e.off, e.length, kind, of.Writable)
 		if res == nil {
 			if e.flags&lockFlagUnlock == 0 {
 				done = append(done, applied{e.off, e.length})
 			}
 			continue
 		}
-		if e := errnoOf(res); e == unix.EAGAIN || e == unix.EACCES {
-			fail = StatusLockNotGranted
-		} else {
-			fail = StatusFromErrno(e)
-		}
+		fail = lockStatus(res)
 		break
 	}
 	if fail != StatusSuccess {
 		for i := len(done) - 1; i >= 0; i-- {
-			_ = rangeLock(of.File, done[i].off, done[i].length, LockUnlock)
+			_ = rangelock.Lock(of.File, done[i].off, done[i].length, rangelock.Unlock, of.Writable)
 		}
 		errResp(tx, h, fail, chain)
 		return

@@ -1,6 +1,14 @@
 package samba
 
-import "fmt"
+import (
+	"fmt"
+	"runtime"
+
+	"github.com/malivvan/samba/pkg/rangelock"
+	"github.com/malivvan/samba/pkg/reuseport"
+	"github.com/malivvan/samba/pkg/watch"
+	"github.com/malivvan/samba/pkg/zerocopy"
+)
 
 // Introspection: what this build implements, and the live state of a running
 // server.
@@ -112,6 +120,76 @@ func Ciphers() []Cipher {
 	return append([]Cipher(nil), ciphers...)
 }
 
+// Facility is one mechanism the server takes from the host, with what this build
+// actually gets on the platform it was compiled for.
+//
+// The server asks the platform for four things it cannot implement itself —
+// sharing a listening port between workers, watching a directory for changes,
+// taking a byte-range lock, and moving file bytes to a socket — and every one of
+// them has a native answer on some platforms and a documented fallback on
+// others. Reporting which one is in use is what makes a downgrade visible
+// instead of silent, which matters most for the two that are security-adjacent:
+// a lock that is no longer enforced against local processes, and a directory
+// watch that no longer names what changed.
+type Facility struct {
+	// Name is the report key, e.g. "platform notify". It is deliberately
+	// distinct from the capability name above it, because the capability says
+	// the server can do the thing and the facility says where the mechanism came
+	// from.
+	Name string
+	// Detail names the implementation in use: the syscall where the platform has
+	// one, or the fallback.
+	Detail string
+	// Native reports whether the platform provides the mechanism itself. A false
+	// value is a documented degradation, not a failure: the server works, with
+	// the consequence stated in the Detail and in the README support table.
+	Native bool
+	// Fallbacks counts transfers that took a fallback path at runtime, where the
+	// server can count them (zero-length reads are not counted). It is the same
+	// number `samba --check` prints, and it is how an operator notices that the
+	// fast path is not being taken.
+	Fallbacks int64
+}
+
+// PlatformFacilities reports the mechanisms the compiled platform provides.
+//
+// The values come from the packages that implement them, never from strings
+// written here, so this report cannot describe a mechanism the binary does not
+// have. TestPlatformFacilitiesMatchThePackages pins that.
+func PlatformFacilities() []Facility {
+	reuse := "one shared listener"
+	if reuseport.Available() {
+		reuse = "SO_REUSEPORT"
+	}
+	return []Facility{
+		{
+			Name:   "platform listeners",
+			Detail: reuse,
+			Native: reuseport.Available(),
+		},
+		{
+			Name:   "platform notify",
+			Detail: watch.Backend(),
+			Native: watch.Supported(),
+		},
+		{
+			Name:   "platform locks",
+			Detail: rangelock.Backend(),
+			Native: rangelock.Backend() != "in-process",
+		},
+		{
+			Name:      "platform copy",
+			Detail:    zerocopy.Backend(),
+			Native:    zerocopy.Backend() != "buffered",
+			Fallbacks: zerocopy.Fallbacks(),
+		},
+	}
+}
+
+// PlatformName is the platform this build runs on, in the GOOS/GOARCH spelling
+// the support table uses.
+func PlatformName() string { return runtime.GOOS + "/" + runtime.GOARCH }
+
 // Capability is one thing the server can do, with whether the configuration in
 // hand turns it on.
 type Capability struct {
@@ -179,11 +257,48 @@ func (s *Srv) Capabilities() []Capability {
 		{Name: "encryption", Detail: encryption, Enabled: true},
 		{Name: "multichannel", Detail: multichannel, Enabled: cfg.Multichannel},
 		{Name: "leases", Detail: "read- and handle-caching; write-caching is never granted", Enabled: cfg.Oplocks},
-		{Name: "byte-range locks", Detail: "OFD locks, all-or-nothing batches", Enabled: true},
-		{Name: "change notification", Detail: "inotify-backed asynchronous completion", Enabled: true},
-		{Name: "zero-copy reads", Detail: "splice(2): file pages straight to the socket", Enabled: true},
+		{Name: "byte-range locks", Detail: lockDetail(), Enabled: true},
+		{Name: "change notification", Detail: notifyDetail(), Enabled: true},
+		{Name: "zero-copy reads", Detail: zeroCopyDetail(), Enabled: true},
 		{Name: "compound requests", Detail: "related and unrelated chaining", Enabled: true},
 		{Name: "resource limits", Detail: conns, Enabled: true},
+	}
+}
+
+// lockDetail, notifyDetail and zeroCopyDetail describe the platform mechanism
+// behind a capability, read from the package that implements it rather than
+// written here — the same rule the dialect and cipher tables follow, applied to
+// the parts of the server that come from the host.
+func lockDetail() string {
+	switch rangelock.Backend() {
+	case "OFD":
+		return "open-file-description locks, all-or-nothing batches"
+	case "LockFileEx":
+		return "LockFileEx locks, all-or-nothing batches"
+	default:
+		return "in-process locks, all-or-nothing batches; not enforced against local processes"
+	}
+}
+
+func notifyDetail() string {
+	switch watch.Backend() {
+	case "inotify", "ReadDirectoryChangesW":
+		return watch.Backend() + ", asynchronous completion with the changed name"
+	case "kqueue":
+		return "kqueue, asynchronous completion; the client re-enumerates for the name"
+	default:
+		return "polling, asynchronous completion; up to the poll interval late"
+	}
+}
+
+func zeroCopyDetail() string {
+	switch zerocopy.Backend() {
+	case "splice":
+		return "splice(2): file pages straight to the socket"
+	case "sendfile":
+		return "sendfile(2): file pages straight to the socket"
+	default:
+		return "buffered copy through userspace"
 	}
 }
 

@@ -45,7 +45,7 @@ loop, not an occasional extra.
 | `ntlm_test.go` | Token classification (raw and SPNEGO-wrapped), CHALLENGE shape, a full NTLMv2 challenge/response round trip, wrong password and tampered challenge rejection, the RC4 key-exchange path |
 | `spnego_test.go` | DER length forms, the mechanism hint (NTLMSSP only — Kerberos must never be advertised), classification of SPNEGO-wrapped and raw tokens including a Kerberos AP-REQ, raw NTLMSSP, NegTokenResp round trip, malformed-blob robustness |
 | `config_test.go` | Defaults, unknown-key rejection, every validation rule, the user database (password and `nt_hash`), guest defaults, and a guard that the shipped `samba.toml.example` loads |
-| `vfs_test.go` | Traversal/NUL rejection, handle-table generation safety, FILETIME conversion and `UTIME_OMIT` sentinels, directory snapshot patterns and hidden-attribute handling, errno → NTSTATUS mapping |
+| `vfs_test.go` | Traversal/NUL rejection, handle-table generation safety, FILETIME conversion and the "leave this timestamp unchanged" sentinels, directory snapshot patterns and hidden-attribute handling, errno → NTSTATUS mapping, and byte-range locking through `pkg/rangelock` |
 | `lease_test.go` | Mailbox post/drain and wake semantics, lease grant/refresh, break-only-conflicting-keys, unleased writers break everything, connection teardown releases its grants |
 | `netinfo_test.go` | `NETWORK_INTERFACE_INFO` encoding (152 bytes per interface, `Next` chain, link speed, IPv4/IPv6 family), interface enumeration |
 | `handlers_test.go` | `RqLs` lease-context parsing (v1, v2, non-lease, truncated, no-progress `Next`), OPLOCK_BREAK frame shape, CHANGE_NOTIFY completion framing and its degrade-to-re-enumerate behaviour |
@@ -54,12 +54,31 @@ loop, not an occasional extra.
 | `malformed_test.go` | Every request truncated at every length: the server must answer with a protocol error, never panic, never accept garbage and never drop the connection — the error branch of every body decoder in one sweep |
 | `auth_test.go` | The session-setup branches: SPNEGO wrapping, re-authentication, guest and anonymous decisions, encryption-required refusals, the refusal of a Kerberos token, and the full multichannel channel-binding handshake (accepted, rejected, and guest) |
 | `limits_test.go`, `caps_test.go` | The resource limits and the budget's blocking/shutdown semantics, and the protocol-level refusal of each cap |
-| `hardening_test.go` | The transport's hardening: the connection cap, incomplete-frame reaping, the zero-copy stall deadline and its correctness, break routing, deferred-frame writing, panic containment, and clean shutdown |
+| `hardening_test.go` | The transport's hardening: the connection cap, incomplete-frame reaping, the listener rejecting an unusable address, break routing, deferred-frame writing, panic containment, and clean shutdown |
 | `edge_test.go` | The remaining edges: AEAD and CMAC error paths, the CCM length-prefix forms, `clamp`/`isHex`, handle-table misses, the response write stall, and path/metadata variants |
-| `server_test.go` | The same things over a real socket: framing, batched pipelining, the zero-copy read path at several offsets (in a deliberately non-sequential order), IOCTL FSCTLs, a CHANGE_NOTIFY that completes from a real inotify event, **a lease break delivered to the other client**, and rejection of a desynchronized stream |
-| `introspect_test.go` | The introspection contract: the published dialect and cipher lists against the negotiation code that consumes them (names, revision codes, key sizes, preference order), the capability report against a configuration, and the live counters against a real connection |
+| `server_test.go` | The same things over a real socket: framing, batched pipelining, the zero-copy read path at several offsets (in a deliberately non-sequential order), IOCTL FSCTLs, a CHANGE_NOTIFY that completes from a real filesystem event, **a lease break delivered to the other client**, and rejection of a desynchronized stream |
+| `notify_test.go` | The CHANGE_NOTIFY plumbing above `pkg/watch`: a change completes the pending operation (with the entry's name where the platform's mechanism reports one), several pends on one directory share a single watch and complete independently, an unwatchable path completes with an error instead of hanging, clean shutdown, and the action codes pinned to the wire numbering |
+| `introspect_test.go` | The introspection contract: the published dialect and cipher lists against the negotiation code that consumes them (names, revision codes, key sizes, preference order), the capability report against a configuration, the live counters against a real connection, and the platform report against the `pkg/` packages that implement the mechanisms |
 | `version_test.go` | `Version` against the newest released `CHANGELOG.md` heading — the drift the release job refuses to publish |
 | `cmd/main_test.go`, `cmd/cli_test.go` | The CLI: exit statuses, `--help` completeness, the `--list-*` reports, that `--dump-config` never prints a credential, that the overrides beat the file, and that the report carries every capability the library publishes with the right state |
+
+### The platform facilities (`pkg/`)
+
+Every facility the server takes from the host has its own package with a test
+suite that runs on **every** platform CI has a runner for, not only on the one
+that motivated the code. That is deliberate: the fallbacks are as much a part of
+the contract as the native mechanisms, and an untested fallback is a fallback
+that fails in production.
+
+| Package | What its tests assert |
+|---|---|
+| `pkg/reuseport` | That `Available()` matches the platform's documented answer, that `Listeners(n)` returns `n` sockets on one address where the platform can share it and exactly one where it cannot, that a second bind on a platform without reuse fails rather than taking the port over, that the sockets really carry connections, and that an unusable address is refused |
+| `pkg/watch` | The same behaviours through whichever mechanism the platform has — a create, a delete, a content change and a rename each complete a watch — with the *differences* asserted rather than skipped: a mechanism that names entries must name them, and kqueue, which cannot, must deliver the "re-enumerate" answer instead. Plus watch sharing and reference counting, a watched directory that disappears, IDs not being reused, idempotent close, and concurrent add/remove/close under the race detector |
+| `pkg/watch` (polling) | The fallback in full, on every platform: named create/modify/delete and rename events, a directory that disappears, the sweep bound, a quiet directory producing nothing, watch sharing, and the listing diff itself (including the overflow case, driven deterministically instead of racing the ticker) |
+| `pkg/watch` (inotify) | The kernel-record decoder: every mask mapped to the action the client expects, a nameless event kept, self-gone and ignored watches, and truncation at every length — a malformed record must not be read past |
+| `pkg/rangelock` | Protocol semantics rather than kernel semantics: shared locks coexisting, an exclusive one conflicting, a handle converting its own range, a partial unlock splitting a range, zero length meaning "to the end of the file", the top of the 64-bit address space, the write-access rule, `Release` dropping a handle's locks, the range bound and its release, coalescing, and the interval arithmetic (`normalizeRange`, `kernelRange`, `subtract`, `coalesce`) directly |
+| `pkg/zerocopy` | The contract every backend must satisfy, over a loopback pair: sizes and offsets that straddle the pipe and the `sendfile` chunk, **the file's own offset left untouched**, a file that shrinks under the transfer reported as an error, a stalled peer bounded by the stall deadline, a slow drain, a zero-length send, and the buffered fallback (proved with a connection that cannot hand out a raw descriptor) — so all three implementations are exercised wherever the suite runs |
+| `pkg/fsutil` | Metadata from a path and from a handle agreeing, symlinks not followed by `LstatPath`, a stable and distinct file identity, timestamps set and *omitted* correctly, filesystem sizes in a plausible shape, `DirOpenFlags` doing its job, the read-ahead hint never failing a caller, and the pure conversions (`blockUnits`, `normalizeRange`-style clamps) directly |
 
 ## Coverage
 
@@ -105,20 +124,36 @@ run):
 
 | Job | What it does | Gates the release |
 |---|---|---|
-| `test` | `gofmt`, `go vet`, a `CGO_ENABLED=0` build, `go test ./...` and `go test -race ./...` on Ubuntu, macOS and Windows | yes (Linux leg) |
+| `test` | Linux: `gofmt`, `go vet`, a `CGO_ENABLED=0` build, `go test ./...`, `go test -race ./...`, and a check that `--list-platform` still reports the four native Linux mechanisms | yes |
+| `platform` | macOS and Windows: `gofmt`, `go vet` (tests included), a `CGO_ENABLED=0` build, and **`go test ./pkg/...`** — the per-platform facility suite, *run* rather than compiled | yes |
 | `lint` | `golangci-lint` with `.golangci.yml`, plus the guard that no shipping file imports `C` or `unsafe` | yes |
 | `coverage` | `go test -covermode=atomic -coverprofile`, the total printed, the profile uploaded as an artifact, and the result sent to Coveralls | yes |
 | `fuzz` | Every target in the table above, 60s each on a push and 15 minutes each weekly; crashers are uploaded as artifacts | yes |
 | `interop` | `bench/interop-smbclient.sh` against the built binary | no |
-| `cross-build` | `GOOS=linux GOARCH=arm64 go build ./...` | no |
+| `cross-build` | `go build` + `go vet` of the whole module (tests included) for linux/arm64, linux/386, darwin/arm64, darwin/amd64, freebsd/amd64, freebsd/arm64, openbsd/amd64, netbsd/amd64, netbsd/arm, dragonfly/amd64, windows/arm64, solaris/amd64 and js/wasm | yes |
 | `release` | Only on a `v*` tag: builds both static binaries, smoke-tests `--version` and `--check`, runs the benchmarks, and creates the GitHub release with the results in its description | — |
 
-Two things about that are deliberate and easy to mistake for mistakes:
+Three things about that are deliberate and easy to mistake for mistakes:
 
-- **The macOS and Windows legs are `continue-on-error`.** The server is
-  Linux-only by design (`docs/PORTING.md`), so those legs cannot build yet. They
-  run so the drift is visible the day it changes, but only the Linux leg is a
-  gate — a red Windows leg never blocks lint, coverage or a release.
+- **What runs where is decided by what each platform can provide.** The four
+  facilities the server needs from the host — a shared listening port, directory
+  watching, byte-range locks, file→socket copies — live in `pkg/` with one
+  implementation per platform (the map is the README support table), so the
+  *platform-specific* code is the `pkg/` tree. Linux runs everything and is the
+  platform with every mechanism native. macOS and Windows run `go test ./pkg/...`
+  for real, which is what executes kqueue, `sendfile(2)`, `fstatfs`, `futimes(2)`,
+  `ReadDirectoryChangesW`, `LockFileEx` and the `FILE_FS_SIZE_INFORMATION` path.
+  FreeBSD, OpenBSD, NetBSD and DragonFly BSD cannot be run on a GitHub-hosted
+  runner: their legs are `go build` + `go vet`, so their code —
+  `kqueue` on a BSD kernel, `statvfs` on NetBSD, `fstatfs` on OpenBSD and
+  DragonFly, `sendfile` against a BSD socket — is compile-verified, not
+  runtime-verified. The README support table says exactly that.
+- **No third-party action runs a BSD VM.** A QEMU-backed VM action
+  (`vmactions/freebsd-vm` and friends) would close that gap and is the obvious
+  next step, but it means adding an unreviewed third-party action to a CI that
+  this project treats as part of its supply chain. That is a maintainer's
+  decision, not a convenience to take silently; it is recorded as an open item in
+  [ROADMAP.md](../ROADMAP.md).
 - **`release` is gated by `needs`,** so it is skipped, not failed, when any of
   `lint`, `coverage`, `test` or `fuzz` does not pass. It also refuses to publish
   a tag that disagrees with `Version` in `doc.go`; `TestVersionMatchesChangelog`

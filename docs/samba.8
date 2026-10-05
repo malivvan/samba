@@ -9,6 +9,7 @@ samba \- pure-Go SMB2/SMB3 file server (zero-copy reads, multichannel)
 [\fB\-\-list\-dialects\fR]
 [\fB\-\-list\-ciphers\fR]
 [\fB\-\-list\-interfaces\fR]
+[\fB\-\-list\-platform\fR]
 [\fB\-\-log\-level\fR \fIn\fR]
 [\fB\-\-listen\fR \fIaddr\fR]
 [\fB\-\-workers\fR \fIn\fR]
@@ -29,12 +30,15 @@ SMB 3.1.1 preauth integrity, SMB3 multichannel,
 SMB3 encryption (AES-128/256-GCM and AES-128/256-CCM), byte-range locks,
 directory change notification, and read- and handle-caching leases.
 .PP
-Large unsigned reads never copy the file's data through userspace: the response
-header is written and the kernel moves page-cache pages straight into the socket
-with
-.BR splice (2).
-Reads that must be signed or encrypted, and reads inside a compound request,
-take a buffered positional-read path instead.
+Large unsigned reads never copy the file's data through userspace where the
+platform allows it: the response header is written and the kernel moves
+page-cache pages straight into the socket with
+.BR splice (2)
+on Linux or
+.BR sendfile (2)
+on macOS and the BSDs. Reads that must be signed or encrypted, reads inside a
+compound request, and the platforms with neither call take a buffered
+positional-read path instead.
 .PP
 At \fBlog_level\fR 1 or above the server logs a banner reporting every
 capability it is about to advertise. The same report, from the same source, is
@@ -42,7 +46,9 @@ what
 .B \-\-check
 prints, and the negotiation facts are what the
 .B \-\-list\-\fR
-options print.
+options, plus
+.B \-\-list\-platform
+for the mechanisms this host provides.
 .SH OPTIONS
 .TP
 .BR \-c " " \fIpath\fR ", " \-\-config " " \fIpath\fR
@@ -72,6 +78,14 @@ Print the multichannel interface advertisement after the \fBadvertise_only\fR
 filter: the addresses, link speeds and capability bits a client uses to decide
 how many channels to open.
 .TP
+.B \-\-list\-platform
+Print the host mechanisms this build uses — how the listening port is shared,
+how directories are watched, how byte-range locks are taken and how file bytes
+reach the socket — with which of them are the platform's own and which are the
+documented fallbacks. No configuration is needed. The same report, for the
+mechanisms a capability depends on, is part of
+.BR \-\-check .
+.TP
 .B \-\-log\-level " " \fIn\fR
 Override \fBlog_level\fR: 0 (warn), 1 (info) or 2 (debug).
 .TP
@@ -79,8 +93,7 @@ Override \fBlog_level\fR: 0 (warn), 1 (info) or 2 (debug).
 Override \fBlisten\fR.
 .TP
 .B \-\-workers " " \fIn\fR
-Override \fBworkers\fR: the number of SO_REUSEPORT listeners, or 0 for one per
-CPU core.
+Override \fBworkers\fR: the number of accept loops, or 0 for one per CPU core.
 .TP
 .BR \-V ", " \-\-version
 Print the version and exit.
@@ -100,8 +113,9 @@ Bind address, default \fB"0.0.0.0:445"\fR. Binding 445 needs
 CAP_NET_BIND_SERVICE or root.
 .TP
 .B workers
-Listener goroutines, each with its own SO_REUSEPORT listener. 0 = one per CPU
-core.
+Listener goroutines, each accepting independently: with SO_REUSEPORT each has
+its own socket on the port, and on a platform without it they share one. 0 =
+one per CPU core.
 .TP
 .B server_name
 Advertised server name (\fB"SAMBA"\fR by default).

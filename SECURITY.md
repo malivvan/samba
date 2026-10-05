@@ -110,12 +110,27 @@ external security review has been done yet. Know the following before deploying.
   outside it** (like Samba's `wide links`). Clients cannot create symlinks over
   SMB, so only someone with local access to the share tree can plant one.
 - **Resource limits** — every client-controllable resource is bounded
-  (connections, sessions, handles, inotify watches, leases, buffered request
-  bytes) and every stall is timed out, so a single peer cannot exhaust a shared
-  resource or hold one forever. A peer that trips a bug cannot take the process
-  down either: each connection and worker runs under a panic guard that logs the
-  stack and drops only that connection. The limits, the timeouts and the
-  reasoning behind each are in [REVIEW.md](REVIEW.md).
+  (connections, sessions, handles, directory watches, locked byte ranges,
+  leases, buffered request bytes) and every stall is timed out, so a single peer
+  cannot exhaust a shared resource or hold one forever. A peer that trips a bug
+  cannot take the process down either: each connection and worker runs under a
+  panic guard that logs the stack and drops only that connection. The limits, the
+  timeouts and the reasoning behind each are in [REVIEW.md](REVIEW.md).
+- **What the host can enforce differs per platform** — the protocol guarantees
+  (signing, encryption, preauth integrity, the limits above, the panic guards)
+  are pure Go and identical everywhere, but three things the operating system
+  owns are not. On macOS and the BSDs a byte-range lock is enforced between SMB
+  clients only, not against a local process, because those platforms have only
+  process-scoped POSIX locks; on Windows a large READ is copied through
+  userspace; and on kqueue platforms a directory change is reported without the
+  name of the entry that changed. None of these weakens authentication,
+  authorization or the integrity of what a client receives, and all of them are
+  in the README [support table](README.md#platform-support) with their
+  consequences. `samba --list-platform` reports what the running binary got.
+  What they do mean, on every platform, is that **a share must not be readable
+  by a local process as well as over SMB**: a lease held over SMB is not broken
+  by a local writer (there is no kernel-oplock integration), so the two can
+  disagree about the file's contents.
 - **Deployment** — the goal is a server that is safe to put on the public
   internet, but a full security review has not been done, so read that as the
   direction of travel rather than a warranty. For anything beyond a trusted LAN,

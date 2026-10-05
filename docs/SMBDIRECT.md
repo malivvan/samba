@@ -26,7 +26,7 @@ kept so the work can be picked up deliberately rather than rediscovered.
 ## Why it does not fit the current Go transport
 
 The existing transport is deliberately plain `net` (`SO_REUSEPORT` listeners,
-goroutine per direction, splice for the bulk transfer). RDMA needs a userspace
+goroutine per direction, `splice`/`sendfile` for the bulk transfer). RDMA needs a userspace
 HCA library — which, in Go, means either CGO (forbidden here) or a native
 in-kernel interface that Go does not expose. A real implementation would have to
 be a separate, build-tagged transport behind the same protocol layer

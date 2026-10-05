@@ -1,15 +1,13 @@
 package samba
 
 import (
-	"errors"
 	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/malivvan/samba/pkg/reuseport"
 )
 
 // Socket-level tests for the hardening added on review: the limits that keep one
@@ -86,165 +84,11 @@ func TestServerReapsIncompleteFrame(t *testing.T) {
 	}
 }
 
-// TestSpliceStallTimeout checks that the zero-copy pump gives up on a peer that
-// stops making progress, rather than pinning the transfer (and its goroutine,
-// pipe and descriptor) indefinitely.
-func TestSpliceStallTimeout(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Skipf("socketpair unavailable: %v", err)
-	}
-	// Shrink the buffers so the pump stalls quickly and deterministically.
-	_ = unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
-	sendFile := os.NewFile(uintptr(fds[0]), "send")
-	recvFile := os.NewFile(uintptr(fds[1]), "recv")
-	defer recvFile.Close()
-	conn, err := net.FileConn(sendFile)
-	if err != nil {
-		t.Fatalf("FileConn: %v", err)
-	}
-	defer conn.Close()
-	target, ok := conn.(spliceTarget)
-	if !ok {
-		t.Skipf("the socket pair did not produce a splices-able connection (%T)", conn)
-	}
-
-	// A payload far larger than the socket can buffer, with nobody reading the
-	// other end.
-	src, err := os.CreateTemp(t.TempDir(), "src")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer src.Close()
-	if _, err := src.Write(make([]byte, 4<<20)); err != nil {
-		t.Fatal(err)
-	}
-
-	start := time.Now()
-	err = spliceFileToConn(target, src, 0, 4<<20, 150*time.Millisecond)
-	if err == nil {
-		t.Fatal("a stalled peer must abort the transfer")
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("the stall timeout did not fire promptly (%v)", elapsed)
-	}
-}
-
-// TestSpliceTransfersCorrectly is the happy path for the pump, over a socket
-// pair with a reader: the bytes must arrive intact and in order.
-func TestSpliceTransfersCorrectly(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Skipf("socketpair unavailable: %v", err)
-	}
-	sendFile := os.NewFile(uintptr(fds[0]), "send")
-	recvFile := os.NewFile(uintptr(fds[1]), "recv")
-	defer recvFile.Close()
-	conn, err := net.FileConn(sendFile)
-	if err != nil {
-		t.Fatalf("FileConn: %v", err)
-	}
-	defer conn.Close()
-	target, ok := conn.(spliceTarget)
-	if !ok {
-		t.Skipf("the socket pair did not produce a splices-able connection (%T)", conn)
-	}
-
-	const size = 300 << 10 // larger than the pipe, so the pump loops
-	payload := make([]byte, size)
-	for i := range payload {
-		payload[i] = byte(i * 7)
-	}
-	src := filepath.Join(t.TempDir(), "src")
-	if err := os.WriteFile(src, payload, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Open(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	done := make(chan error, 1)
-	go func() { done <- spliceFileToConn(target, f, 0, size, 5*time.Second) }()
-
-	got := make([]byte, size)
-	if _, err := readFullConn(recvFile, got); err != nil {
-		t.Fatalf("read: %v", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("splice: %v", err)
-	}
-	for i := range got {
-		if got[i] != payload[i] {
-			t.Fatalf("payload differs at byte %d", i)
-		}
-	}
-}
-
-// TestSpliceShortReadReportsError checks that a file that shrinks under the
-// transfer is reported rather than silently truncating the response.
-func TestSpliceShortReadReportsError(t *testing.T) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Skipf("socketpair unavailable: %v", err)
-	}
-	sendFile := os.NewFile(uintptr(fds[0]), "send")
-	recvFile := os.NewFile(uintptr(fds[1]), "recv")
-	defer recvFile.Close()
-	conn, err := net.FileConn(sendFile)
-	if err != nil {
-		t.Fatalf("FileConn: %v", err)
-	}
-	defer conn.Close()
-	target, ok := conn.(spliceTarget)
-	if !ok {
-		t.Skipf("the socket pair did not produce a splices-able connection (%T)", conn)
-	}
-	go func() {
-		buf := make([]byte, 4096)
-		for {
-			if _, err := recvFile.Read(buf); err != nil {
-				return
-			}
-		}
-	}()
-
-	src := filepath.Join(t.TempDir(), "small")
-	if err := os.WriteFile(src, []byte("only a little"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Open(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	// Promise more than the file holds.
-	err = spliceFileToConn(target, f, 0, 1<<20, 2*time.Second)
-	if err == nil {
-		t.Fatal("a short transfer must be reported")
-	}
-	if !errors.Is(err, errZeroCopyShort) && !errors.Is(err, os.ErrDeadlineExceeded) && err == nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-// readFullConn fills buf from f.
-func readFullConn(f *os.File, buf []byte) (int, error) {
-	total := 0
-	for total < len(buf) {
-		n, err := f.Read(buf[total:])
-		total += n
-		if err != nil {
-			return total, err
-		}
-	}
-	return total, nil
-}
-
-// TestListenerRejectsBadAddress covers the startup error path of the listener.
 func TestListenerRejectsBadAddress(t *testing.T) {
-	if _, err := listenReusePort("not-an-address"); err == nil {
+	// The listener creation lives in pkg/reuseport, which decides per platform
+	// whether one socket or several are bound. An unusable address must be
+	// reported the same way wherever the server runs.
+	if _, err := reuseport.Listeners(2, "tcp", "not-an-address"); err == nil {
 		t.Fatal("an invalid address must fail to bind")
 	}
 }
@@ -329,23 +173,48 @@ func TestDeliverBreakRouting(t *testing.T) {
 	}
 }
 
-// socketPair returns two connected, non-blocking connections.
+// socketPair returns two connected connections.
+//
+// This used to be a Unix socketpair. A loopback TCP pair replaces it so the
+// transport tests run wherever the server does — the properties they need are
+// two connected streams, a send buffer small enough to force a stall, and an
+// orderly close, and a TCP connection has all three.
 func socketPair(t *testing.T) (net.Conn, net.Conn) {
 	t.Helper()
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Skipf("socketpair unavailable: %v", err)
+		t.Skipf("no loopback listener: %v", err)
 	}
-	a, err := net.FileConn(os.NewFile(uintptr(fds[0]), "a"))
+	defer ln.Close()
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, err := ln.Accept()
+		ch <- result{c, err}
+	}()
+	a, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("dial: %v", err)
 	}
-	b, err := net.FileConn(os.NewFile(uintptr(fds[1]), "b"))
-	if err != nil {
-		t.Fatal(err)
+	r := <-ch
+	if r.err != nil {
+		t.Fatalf("accept: %v", r.err)
 	}
-	t.Cleanup(func() { a.Close(); b.Close() })
-	return a, b
+	t.Cleanup(func() { a.Close(); r.c.Close() })
+	return a, r.c
+}
+
+// setWriteBuffer shrinks a connection's send buffer, so a test can reach a full
+// socket — and therefore a stalled transfer — in kilobytes rather than
+// megabytes. A connection that will not take the setting is left alone: the
+// tests that use it still assert the same outcome, just less promptly.
+func setWriteBuffer(c net.Conn, size int) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetWriteBuffer(size)
+	}
 }
 
 func TestWriteDeferredBreakAndNotify(t *testing.T) {
@@ -574,70 +443,6 @@ func TestServerClosesOnUndecryptableTransform(t *testing.T) {
 	}
 }
 
-func TestPipeCapacityDefault(t *testing.T) {
-	// An unusable descriptor falls back to the usual pipe size.
-	if got := pipeCapacity(-1); got != 64*1024 {
-		t.Fatalf("pipeCapacity(-1) = %d, want 65536", got)
-	}
-	// A real pipe reports its own capacity.
-	fds := make([]int, 2)
-	if err := unix.Pipe2(fds, unix.O_CLOEXEC); err != nil {
-		t.Skipf("pipe unavailable: %v", err)
-	}
-	defer unix.Close(fds[0])
-	defer unix.Close(fds[1])
-	if got := pipeCapacity(fds[0]); got <= 0 {
-		t.Fatalf("pipeCapacity = %d", got)
-	}
-	// A zero-length transfer is a no-op that still succeeds.
-	f, err := os.CreateTemp(t.TempDir(), "f")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	a, b := socketPair(t)
-	defer b.Close()
-	target, ok := a.(spliceTarget)
-	if !ok {
-		t.Skip("no splice target")
-	}
-	if err := spliceFileToConn(target, f, 0, 0, time.Second); err != nil {
-		t.Fatalf("a zero-length splice must succeed: %v", err)
-	}
-}
-
-// failingSpliceTarget is a connection whose raw descriptor cannot be obtained.
-type failingSpliceTarget struct{}
-
-func (failingSpliceTarget) SyscallConn() (syscall.RawConn, error) {
-	return nil, errors.New("no raw connection")
-}
-
-func TestZeroCopyTargetAndWaitErrors(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "src")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if _, err := f.Write([]byte("payload")); err != nil {
-		t.Fatal(err)
-	}
-	// A connection that cannot hand out its descriptor is reported, not ignored.
-	if err := spliceFileToConn(failingSpliceTarget{}, f, 0, 7, time.Second); err == nil {
-		t.Fatal("a connection without a raw descriptor must be an error")
-	}
-	// Waiting on a descriptor that never becomes writable returns after the poll
-	// timeout rather than blocking: the pump's own stall deadline is what gives
-	// up on the peer (see TestSpliceStallTimeout).
-	start := time.Now()
-	if err := waitWritable(-1); err != nil {
-		t.Fatalf("waitWritable: %v", err)
-	}
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("waitWritable took %v", elapsed)
-	}
-}
-
 func TestLinkSpeedFallback(t *testing.T) {
 	// A loopback interface with no /sys entry still advertises a fast link, so a
 	// client is willing to open extra channels.
@@ -658,57 +463,5 @@ func TestLinkSpeedFallback(t *testing.T) {
 func TestEncodeInterfaceInfoEmpty(t *testing.T) {
 	if got := EncodeInterfaceInfo(nil); len(got) != 0 {
 		t.Fatalf("an empty interface list encodes to %d bytes", len(got))
-	}
-}
-
-func TestSplicePumpPipeFull(t *testing.T) {
-	// Force the in-side to hit a full pipe: a tiny socket, a large transfer and
-	// a reader that only drains at the end exercises the EAGAIN path.
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Skipf("socketpair unavailable: %v", err)
-	}
-	_ = unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 2048)
-	sendFile := os.NewFile(uintptr(fds[0]), "send")
-	recvFile := os.NewFile(uintptr(fds[1]), "recv")
-	defer recvFile.Close()
-	conn, err := net.FileConn(sendFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	target, ok := conn.(spliceTarget)
-	if !ok {
-		t.Skip("no splice target")
-	}
-	const size = 512 << 10
-	src := filepath.Join(t.TempDir(), "src")
-	if err := os.WriteFile(src, make([]byte, size), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Open(src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	done := make(chan error, 1)
-	go func() { done <- spliceFileToConn(target, f, 0, size, 10*time.Second) }()
-	// Drain slowly, so the send side really does fill up and stall.
-	got := 0
-	buf := make([]byte, 8192)
-	for got < size {
-		n, err := recvFile.Read(buf)
-		got += n
-		if err != nil {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("splice failed: %v", err)
-	}
-	if got != size {
-		t.Fatalf("received %d of %d bytes", got, size)
 	}
 }

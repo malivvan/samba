@@ -8,7 +8,10 @@ import (
 	"syscall"
 	"testing"
 
-	"golang.org/x/sys/unix"
+	"time"
+
+	"github.com/malivvan/samba/pkg/fsutil"
+	"github.com/malivvan/samba/pkg/rangelock"
 )
 
 func TestResolveRejectsTraversal(t *testing.T) {
@@ -72,20 +75,30 @@ func TestFiletimeEpoch(t *testing.T) {
 	}
 }
 
-func TestFiletimeToTimespecSentinels(t *testing.T) {
-	if got := filetimeToTimespec(0); got.Nsec != unix.UTIME_OMIT {
-		t.Fatalf("0 must mean UTIME_OMIT, got %+v", got)
+// TestFiletimeSentinels pins the two values SET_INFO uses for "leave this
+// timestamp unchanged". They are what stop a client that sends only a
+// modification time from having the access time reset, on every platform —
+// pkg/fsutil expresses the omission in the way each one can.
+func TestFiletimeSentinels(t *testing.T) {
+	if !omitted(0) {
+		t.Fatal(`a zero FILETIME must mean "leave unchanged"`)
 	}
-	if got := filetimeToTimespec(^uint64(0)); got.Nsec != unix.UTIME_OMIT {
-		t.Fatalf("all-ones must mean UTIME_OMIT, got %+v", got)
+	if !omitted(^uint64(0)) {
+		t.Fatal(`an all-ones FILETIME must mean "leave unchanged"`)
 	}
-	ts := filetimeToTimespec(116_444_736_000_000_000)
-	if ts.Sec != 0 || ts.Nsec != 0 {
-		t.Fatalf("epoch sentinel = %+v", ts)
+	if omitted(1) {
+		t.Fatal("a real FILETIME must not be treated as omitted")
 	}
-	ts = filetimeToTimespec(116_444_736_000_000_000 + 15_000_000)
-	if ts.Sec != 1 || ts.Nsec != 500_000_000 {
-		t.Fatalf("1.5s = %+v", ts)
+	// The epoch converts to the Unix epoch, and a fractional value keeps its
+	// 100ns resolution.
+	if got := filetimeToTime(116_444_736_000_000_000); !got.Equal(time.Unix(0, 0)) {
+		t.Fatalf("the FILETIME epoch converted to %v", got)
+	}
+	if got := filetimeToTime(116_444_736_000_000_000 + 15_000_000); !got.Equal(time.Unix(1, 500_000_000)) {
+		t.Fatalf("1.5s converted to %v", got)
+	}
+	if got := filetimeToTime(0); !got.IsZero() {
+		t.Fatalf("the omitted sentinel converted to %v, want the zero time", got)
 	}
 }
 
@@ -318,7 +331,7 @@ func TestVfsFileOperations(t *testing.T) {
 	if n, err := pread(f, make([]byte, 16), int64(len(data))+100); err != nil || n != 0 {
 		t.Fatalf("pread past EOF = %d, %v", n, err)
 	}
-	// fstatMeta reports the size, and fsSizes reports a filesystem.
+	// fstatMeta reports the size, and fsutil.Sizes reports a filesystem.
 	m, err := fstatMeta(f)
 	if err != nil {
 		t.Fatal(err)
@@ -326,18 +339,18 @@ func TestVfsFileOperations(t *testing.T) {
 	if m.Size != uint64(len(data)) || m.IsDir {
 		t.Fatalf("meta = %+v", m)
 	}
-	total, avail, free, spu, bps, err := fsSizes(f)
+	total, avail, free, spu, bps, err := fsutil.Sizes(f, path)
 	if err != nil {
-		t.Fatalf("fsSizes: %v", err)
+		t.Fatalf("Sizes: %v", err)
 	}
 	if total == 0 || spu == 0 || bps != 512 || avail > total || free < avail {
-		t.Fatalf("fsSizes = %d/%d/%d/%d/%d", total, avail, free, spu, bps)
+		t.Fatalf("Sizes = %d/%d/%d/%d/%d", total, avail, free, spu, bps)
 	}
-	// fsync and adviseSequential are best-effort.
+	// fsync and AdviseSequential are best-effort.
 	if err := f.Sync(); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	adviseSequential(f)
+	fsutil.AdviseSequential(f)
 	// ftruncate shortens it.
 	if err := f.Truncate(16); err != nil {
 		t.Fatalf("truncate: %v", err)
@@ -380,42 +393,50 @@ func TestVfsRangeLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ro.Close()
-	if err := rangeLock(ro, 2000, 10, LockShared); err != nil {
+	// The write-access rule is enforced from the handle's own record, not left to
+	// the kernel: Windows would allow an exclusive lock through a read-only
+	// handle, so passing writeAccess false here is what keeps the answer the same
+	// on every platform.
+	if err := rangelock.Lock(ro, 2000, 10, rangelock.Shared, false); err != nil {
 		t.Fatalf("shared lock on a read-only descriptor: %v", err)
 	}
-	if err := rangeLock(ro, 2000, 10, LockExclusive); err == nil {
-		t.Fatal("an exclusive lock on a read-only descriptor must fail")
+	if err := rangelock.Lock(ro, 2000, 10, rangelock.Exclusive, false); !errors.Is(err, rangelock.ErrNoWriteAccess) {
+		t.Fatalf("an exclusive lock on a read-only descriptor = %v, want ErrNoWriteAccess", err)
 	}
-	if err := rangeLock(ro, 2000, 10, LockUnlock); err != nil {
+	if err := rangelock.Lock(ro, 2000, 10, rangelock.Unlock, false); err != nil {
 		t.Fatalf("unlock on a read-only descriptor: %v", err)
 	}
 
-	if err := rangeLock(a, 0, 100, LockShared); err != nil {
+	if err := rangelock.Lock(a, 0, 100, rangelock.Shared, true); err != nil {
 		t.Fatalf("shared lock: %v", err)
 	}
-	if err := rangeLock(b, 0, 100, LockShared); err != nil {
+	if err := rangelock.Lock(b, 0, 100, rangelock.Shared, true); err != nil {
 		t.Fatalf("second shared lock: %v", err)
 	}
-	if err := rangeLock(a, 0, 100, LockExclusive); err == nil {
-		t.Fatal("a conflicting exclusive lock must fail")
+	if err := rangelock.Lock(a, 0, 100, rangelock.Exclusive, true); !errors.Is(err, rangelock.ErrNotGranted) {
+		t.Fatalf("a conflicting exclusive lock = %v, want ErrNotGranted", err)
 	}
-	if err := rangeLock(a, 0, 100, LockUnlock); err != nil {
+	if err := rangelock.Lock(a, 0, 100, rangelock.Unlock, true); err != nil {
 		t.Fatalf("unlock: %v", err)
 	}
-	if err := rangeLock(b, 0, 100, LockUnlock); err != nil {
+	if err := rangelock.Lock(b, 0, 100, rangelock.Unlock, true); err != nil {
 		t.Fatalf("second unlock: %v", err)
 	}
-	if err := rangeLock(a, 0, 100, LockExclusive); err != nil {
+	if err := rangelock.Lock(a, 0, 100, rangelock.Exclusive, true); err != nil {
 		t.Fatalf("exclusive lock after unlock: %v", err)
 	}
 	// A zero length means "to the end of the file".
-	if err := rangeLock(a, 0, 0, LockUnlock); err != nil {
+	if err := rangelock.Lock(a, 0, 0, rangelock.Unlock, true); err != nil {
 		t.Fatalf("whole-file unlock: %v", err)
 	}
 	// Locking an absurd range is clamped rather than overflowing.
-	if err := rangeLock(a, ^uint64(0), ^uint64(0), LockUnlock); err != nil {
+	if err := rangelock.Lock(a, ^uint64(0), ^uint64(0), rangelock.Unlock, true); err != nil {
 		t.Fatalf("clamped range: %v", err)
 	}
+	// Dropping every reference hands the ranges back.
+	rangelock.Release(a)
+	rangelock.Release(b)
+	rangelock.Release(ro)
 }
 
 func TestVfsDirSnapshotErrors(t *testing.T) {

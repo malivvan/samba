@@ -22,7 +22,11 @@ Description: pure-Go SMB2/SMB3 file server (zero-copy reads, multichannel)
  byte-range locks, leases, and directory change notification.
  .
  Large unsigned reads move file pages to the socket through splice(2) without
- ever entering userspace.
+ ever entering userspace, and the host facilities the server needs (a shared
+ listening port, directory watching, byte-range locks, file-to-socket copies)
+ are native on Linux.
  .
- Requires a Linux kernel with SO_REUSEPORT, inotify and splice (any supported
- kernel) and the capability to bind port 445.
+ Requires the capability to bind port 445. The package is Linux-only because
+ this is the Linux distribution's package: the same source builds and runs on
+ macOS, the BSDs and Windows, where those facilities use the platform's own
+ mechanism or a documented fallback (see the README support table).

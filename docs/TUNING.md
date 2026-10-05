@@ -24,11 +24,16 @@ mount -t cifs //server/data /mnt -o username=...,vers=3.1.1,multichannel,max_cha
 The server advertises its interfaces (with link speed and RSS capability)
 through `FSCTL_QUERY_NETWORK_INTERFACE_INFO`; the client decides how many
 channels to open from that. Each channel lands on a different worker because
-every worker has its own `SO_REUSEPORT` listener.
+every worker has its own `SO_REUSEPORT` listener (on a platform without that
+option — Windows — the workers share one socket instead, and the difference is
+only who balances the accepts; see the README support table).
 
 Note the interaction with signing: a signed channel takes the buffered read
 path, so signed multichannel throughput is bounded by AES-CMAC, not by the
-network. Use guest or unsigned traffic for maximum read throughput.
+network. Use guest or unsigned traffic for maximum read throughput. The same
+applies to the platform itself: on Windows a large read is copied through
+userspace, so the throughput numbers in `docs/BENCHMARKS.md` (measured on Linux
+with `splice(2)`) are not what a Windows server will do.
 
 ## 2. Check the raw link first
 

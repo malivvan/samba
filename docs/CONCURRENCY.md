@@ -14,8 +14,9 @@ queued.
 Two exceptions are deliberate:
 
 - A **zero-copy READ** defers the rest of the batch: buffered responses are
-  flushed, then the splice runs, then the batch continues. The socket ordering
-  is preserved, and the splice itself is a kernel-side transfer, so the driver
+  flushed, then the transfer runs, then the batch continues. The socket ordering
+  is preserved, and the transfer itself is a kernel-side copy (or a bounded
+  buffered one on Windows), so the driver
   goroutine is not busy copying.
 - Filesystem I/O runs **without** the session lock, so a read on one channel of
   a session does not block another channel of the same session on a different

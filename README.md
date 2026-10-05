@@ -11,9 +11,12 @@ integrity, SMB3 multichannel, and SMB3 encryption (AES-128/256-GCM,
 AES-128/256-CCM)**, plus a user database, optional guest access, byte-range
 locks, leases (read- and handle-caching) and directory change notification.
 
-Large unsigned file reads never copy through userspace: the response header is
-written and the kernel then moves the file's page-cache pages straight into the
-socket through splice(2).
+Large unsigned file reads never copy through userspace where the platform allows
+it: the response header is written and the kernel then moves the file's
+page-cache pages straight into the socket (`splice(2)` on Linux, `sendfile(2)` on
+macOS and the BSDs, a buffered copy on Windows). Which mechanism this build got
+is printed by `samba --list-platform`, and the whole picture — including the
+places a platform falls back — is the [support table](#platform-support) below.
 
 ## What this is for
 
@@ -129,12 +132,149 @@ like-for-like comparison against Samba, and the tuning findings are there too.
 
 ## Requirements
 
-- **Linux.** The transport uses `SO_REUSEPORT`, `inotify`, OFD byte-range locks
-  and the kernel's `splice(2)` path, and there is no non-Linux build.
+- **A supported platform**: Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly
+  BSD or Windows. The four facilities the transport and filesystem layer need
+  from the host each have a native implementation on some of those and a
+  documented fallback on the rest — see [Platform support](#platform-support)
+  for the mechanism per platform, the caveats that follow from it, and what CI
+  actually verifies where.
 - **Go 1.27 or newer** to build.
 - **Capability to bind port 445** (`CAP_NET_BIND_SERVICE`, or run as root).
   TCP 445 (direct TCP, 4-byte NetBIOS length framing) is the only transport:
   there is no NetBIOS (139), no RPC or management API, and no SMB Direct (RDMA).
+
+## Platform support
+
+The server needs four things from the host that pure Go does not provide —
+sharing a listening port between workers, watching a directory for changes,
+locking a byte range, and moving file bytes to a socket — plus the file metadata,
+timestamps and filesystem sizes the protocol reports. Each lives in its own
+package under [`pkg/`](pkg) with one implementation per platform and a *real*
+fallback where the platform has nothing sound: the rule is that a platform gets
+the native mechanism where the mechanism is sound, and a documented, visible
+degradation where it is not, never a fallback that pretends.
+
+`✓` is a native mechanism; `~` is a documented fallback.
+
+| Facility | Linux | macOS | FreeBSD | OpenBSD | NetBSD | DragonFly | Windows |
+|---|---|---|---|---|---|---|---|
+| Shared listening port | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ~ one shared listener ⁽¹⁾ |
+| Directory change notification | ✓ `inotify` | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `ReadDirectoryChangesW` ⁽³⁾ |
+| Byte-range locking | ✓ OFD locks ⁽⁴⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ✓ `LockFileEx` ⁽⁴⁾ |
+| File → socket | ✓ `splice(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ✓ `sendfile(2)` | ~ buffered copy ⁽⁶⁾ |
+| File metadata | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `GetFileInformationByHandle` ⁽⁷⁾ |
+| Timestamps | ✓ `utimensat(2)`, ns | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `SetFileTime`, 100 ns |
+| Filesystem size | ✓ `fstatfs` | ✓ `fstatfs` | ✓ `fstatfs` | ✓ `fstatfs` | ✓ `statvfs` | ✓ `fstatfs` | ✓ `FILE_FS_SIZE_INFORMATION` |
+| Read-ahead hint | ✓ `posix_fadvise` | ~ none ⁽⁹⁾ | ✓ `posix_fadvise` | ~ none ⁽⁹⁾ | ✓ `posix_fadvise` | ~ none ⁽⁹⁾ | ~ none ⁽⁹⁾ |
+
+Two further platform groups are not supported but are worth naming, because what
+they do is part of the same rule:
+
+- **Solaris/illumos, JS and WASI** build and type-check with every fallback at
+  once: polling notifications, the in-process lock registry, buffered reads, and
+  an error (never an invented value) from the timestamp and filesystem-size
+  calls. A JS/WASI build has no socket to serve on, so "builds" is the whole
+  claim there; Solaris/illumos would run, degraded in the ways above, but nothing
+  tests it.
+- **Plan 9 and AIX do not build**, for a reason that predates the platform layer:
+  `status.go` maps POSIX `errno` values that their `syscall` packages do not
+  define. That is a one-file fix if anyone wants those targets; it is not
+  pretended otherwise here.
+
+Every facility reports which mechanism it got: `samba --list-platform` prints the
+table above for the running binary, and `samba --check` reports it next to the
+capabilities. `pkg/watch` also exposes its fallback explicitly
+(`watch.NewPolling`), which is what lets the polling watcher be tested on every
+platform rather than only on the ones that depend on it; the other three choose
+their mechanism at compile time.
+
+### Caveats
+
+Every platform keeps the protocol guarantees — signing, encryption, preauth
+integrity, the resource limits, the panic guards — because none of those are
+platform-dependent. What differs is what the host can enforce or observe, and
+these are the consequences worth knowing before deploying:
+
+- ⁽¹⁾ **Windows has no `SO_REUSEPORT`; its `SO_REUSEADDR` is never set, and the
+  listener is made exclusive instead.** The option called `SO_REUSEADDR` on
+  Windows lets *another* socket forcibly bind an address that is already in use
+  and take its connections, so setting it would be a downgrade rather than
+  portability. Go's `net` package sets nothing for a Windows listener, so this is
+  where the protection comes from: the server asks for
+  **`SO_EXCLUSIVEADDRUSE`**, which is Windows' own answer to port hijacking and
+  what Microsoft recommends for servers — with it, no other socket can bind the
+  address, not even one asking for `SO_REUSEADDR`. Every worker then accepts from
+  one shared socket, so the difference from the other platforms is only *who*
+  balances the accepts (the runtime's accept mutex instead of the kernel), not
+  how many connections the server can hold.
+  The one cost is Microsoft's documented caveat that an exclusively bound port
+  "cannot necessarily be reused immediately after socket closure" while old
+  connections are still winding down; the shipped systemd unit restarts with a
+  delay, and a startup that hits it fails with the bind error rather than
+  silently serving on a port someone else could take.
+- ⁽²⁾ **kqueue reports that a directory changed, not what changed.** The vnode
+  filter is per vnode and a directory's vnode has no notion of which child
+  moved; naming it would need FSEvents, which lives in a framework reachable
+  only through cgo. A change here is delivered as "this directory changed" and
+  the client is told to re-enumerate (`STATUS_NOTIFY_ENUM_DIR`), which is the
+  protocol's own answer for it: correct, just more traffic. Two further
+  consequences: a *content* change to an existing file inside the directory is
+  not noticed at all (the directory's vnode does not change), and a rename
+  arrives as an unattributable change rather than as its two halves.
+- ⁽³⁾ **On Windows, deleting the watched directory itself may not be reported**
+  while the server holds its handle: the handle keeps the directory alive, so
+  the kernel never announces the removal. In practice a client that deletes a
+  directory also closes its handle, and that close is what ends the pending
+  `CHANGE_NOTIFY`, so the case does not hang.
+- ⁽⁴⁾ **Linux and Windows enforce a lock against other local processes too** —
+  the kernel's lock is taken on top of the server's own table, so a local process
+  writing to a share file sees it.
+- ⁽⁵⁾ **macOS and the BSDs do not enforce a lock against local processes.** They
+  have only classic POSIX record locks, which belong to the *process*: two
+  handles of one file never conflict at the kernel, and closing any descriptor
+  releases every lock the process holds on that file. Taking such a lock would be
+  actively wrong (it would drop a sibling handle's lock), so it is not taken, and
+  the server's own registry is authoritative instead. Locks are still enforced
+  between SMB clients, which is what the protocol promises; what is missing is
+  enforcement against a *local* process, exactly as Samba documents for
+  `kernel oplocks`. **Do not mix local and SMB access to one share** on those
+  platforms.
+- ⁽⁶⁾ **Windows reads are copied through userspace.** Its equivalent of
+  `sendfile(2)`, `TransmitFile`, applies the file's own offset rather than an
+  explicit one and is limited to 32-bit request sizes on some paths, so it cannot
+  serve a handle that several session channels read concurrently at different
+  offsets. The copy is correct and bounded; a large sequential READ is simply not
+  as fast as on the other platforms.
+- ⁽⁷⁾ **File identity on Windows** comes from `GetFileInformationByHandle`, so a
+  directory entry that cannot be opened has no identity; such an entry is simply
+  not eligible for a lease (the protocol permits a file to be opened without
+  one).
+- ⁽⁸⁾ **A timestamp update on macOS or the BSDs is microsecond-precise and reads
+  before it writes.** `futimes(2)` sets both timestamps at once and has no
+  `UTIME_OMIT`, so a client that asks to change one of them has the other filled
+  in from the file's current value — a one-syscall window in which a concurrent
+  writer could race it, and only for the timestamp the client asked to leave
+  alone. Linux uses `utimensat(2)` with `AT_EMPTY_PATH` and `UTIME_OMIT` and has
+  neither limitation; Windows expresses "leave unchanged" as a null field.
+- ⁽⁹⁾ **The read-ahead hint is a pure performance hint** and is skipped where the
+  platform's call cannot be reached without `unsafe` (macOS `F_RDADVISE` takes a
+  struct pointer) or does not exist. Nothing about the data a client receives
+  changes; the kernel's own readahead still applies.
+- **Creation time is synthesized from the modification time** on every platform:
+  SMB has a creation time and no portable way to read one, so `mtime` is
+  reported. Live with it or fix it per platform — it is not a platform
+  difference.
+- **Mixing local and SMB access to one share is unsupported everywhere**, because
+  a lease held by an SMB client is not broken by a local process touching the
+  file (there is no kernel-oplock integration). See [ROADMAP.md](ROADMAP.md).
+
+### What CI verifies
+
+| Platform | CI coverage |
+|---|---|
+| Linux | `gofmt`, `go vet`, a `CGO_ENABLED=0` build, the full test suite, the race detector, lint, coverage and fuzzing. The Linux leg is the gate. |
+| macOS, Windows | `gofmt`, `go vet`, a `CGO_ENABLED=0` build of everything, **and `go test ./pkg/...`** — so kqueue, `sendfile`, `fstatfs`/`statvfs`, `futimes`, `ReadDirectoryChangesW`, `LockFileEx` and the `FILE_FS_SIZE_INFORMATION` path are *run*, not just compiled. |
+| FreeBSD, OpenBSD, NetBSD, DragonFly BSD | Cross `go build` and `go vet` (`GOOS=… GOARCH=amd64`, `CGO_ENABLED=0`) of the whole module including tests. **Nothing runs them**: their code paths are compile-verified, not runtime-verified, and the table above states that rather than implying otherwise. |
 
 ## Build
 
@@ -195,7 +335,7 @@ and `--check` can never disagree about what a configuration means.
 | Key | Default | Meaning |
 |---|---|---|
 | `listen` | `"0.0.0.0:445"` | Bind address (`ip:port`). |
-| `workers` | `0` | Listener goroutines, each with its own `SO_REUSEPORT` listener. `0` = one per CPU core. |
+| `workers` | `0` | Listener goroutines, each accepting independently: with `SO_REUSEPORT` each has its own socket on the port, and on a platform without it they share one. `0` = one per CPU core. |
 | `server_name` | `"SAMBA"` | Advertised server name. |
 | `log_level` | `1` | `0` = warn, `1` = info, `2` = debug. |
 | `allow_guest` | true if there are no `[[user]]` entries, else false | Allow unauthenticated guest sessions. |
@@ -245,7 +385,7 @@ real client notices them, and hitting one is a protocol error for that client
 | sessions overall | 65536 | Each carries a handle table. |
 | open handles per session | 16384 | Protects the process descriptor table. |
 | tree connects per session | 4096 | — |
-| pending `CHANGE_NOTIFY` per connection | 256 | Each costs an inotify watch, and the kernel budget is per-user. |
+| pending `CHANGE_NOTIFY` per connection | 256 | Each costs a watch in the platform's own table (`inotify`, `kqueue`, a completion port), and that budget is shared with every other process on the host. Several pends on one directory share a single watch. |
 | leases per file / overall | 64 / 65536 | Handle-caching leases outlive CLOSE. |
 | `QUERY_DIRECTORY` pattern length | 255 characters | Windows' own limit, and it bounds wildcard matching. |
 

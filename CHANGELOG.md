@@ -6,6 +6,61 @@ conventional commits.
 
 ## [Unreleased]
 
+### A supported platform set: Linux, macOS, the BSDs and Windows
+
+The server no longer builds on Linux alone. The four facilities pure Go does not
+provide — sharing a listening port between workers, watching a directory,
+locking a byte range, and moving file bytes to a socket — now live in `pkg/`,
+one implementation per mechanism with a **real, documented fallback** where a
+platform has nothing sound. Nothing above that layer is platform-dependent, so no
+platform gets a weaker protocol: signing, encryption, preauth integrity, the
+resource limits and the panic guards are one Go codebase everywhere.
+
+- **`pkg/reuseport`** — `SO_REUSEPORT` on Linux, macOS and the BSDs; on Windows
+  it deliberately sets *nothing* and hands the workers a single shared socket,
+  because Windows' `SO_REUSEADDR` lets another process take the port over.
+- **`pkg/watch`** — inotify on Linux, kqueue on macOS and the BSDs,
+  `ReadDirectoryChangesW` on Windows, and a polling watcher where none of those
+  exists. The inotify decoder also moved here.
+- **`pkg/rangelock`** — an in-process registry that is authoritative for SMB's
+  per-handle semantics on every platform, with the kernel's own lock on top
+  where the platform has a per-handle kind (OFD locks on Linux, `LockFileEx` on
+  Windows). macOS and the BSDs have only process-scoped POSIX locks, which would
+  be actively wrong here, so they do not take one.
+- **`pkg/zerocopy`** — `splice(2)` on Linux, `sendfile(2)` on macOS and the
+  BSDs, a bounded buffered copy on Windows, plus a fallback to the buffered path
+  when a host filters the syscall (a seccomp container) — counted, so the
+  downgrade is visible.
+- **`pkg/fsutil`** — portable file metadata, timestamps, filesystem sizes and
+  read-ahead hints, including the platforms where each is unavailable
+  (`statvfs` on NetBSD, `SetFileTime` and `FILE_FS_SIZE_INFORMATION` on Windows,
+  and `ErrUnsupported` rather than an invented value in the last resort).
+- **Locks are now bounded**: `rangelock.MaxRangesPerHandle` and
+  `MaxRangesTotal` cap the ranges one handle, and the server, may hold, since a
+  LOCK request carries up to 64 ranges and a client may repeat it. Exceeding
+  either answers `STATUS_INSUFFICIENT_RESOURCES`.
+- **The lock and timestamp paths changed shape.** A lock's write-access rule is
+  enforced from the handle's own record instead of being left to the kernel, so
+  Linux, macOS, the BSDs and Windows answer a client the same way; and a lock
+  conflict is reported as one error whichever table noticed it.
+- **Introspection**: `samba.PlatformFacilities()` and `samba.PlatformName()`, and
+  a new `samba --list-platform` that prints the mechanisms the running binary
+  got. `--check` reports them next to the capabilities, and the capability
+  details for locks, notification and zero-copy reads are now derived from the
+  packages instead of hardcoded — so they cannot claim a mechanism the binary
+  does not have.
+- **CI** now *runs* the platform facilities: `go test ./pkg/...` on macOS and
+  Windows (real kqueue, `sendfile`, `LockFileEx`, `ReadDirectoryChangesW`,
+  `fstatfs`/`statvfs`, `futimes`), while Linux runs the whole suite. The
+  `cross-build` job compiles and vets the module — tests included, which is what
+  keeps the suite portable — for the BSDs and other architectures. No leg is
+  `continue-on-error` any more: every one is a gate.
+- **Documentation**: the README has a platform support table with the mechanism
+  per platform and the caveats that follow from it, `AGENTS.md` records the
+  "degrade visibly, never silently" rule, and `ROADMAP.md` no longer lists a
+  portable build as out of scope — what remains open there is runtime
+  verification on the BSDs, which needs a VM runner.
+
 ### Dialect floor, and a real encryption guarantee
 
 - **`encrypt = true` was silently unenforced for every dialect below 3.1.1, and
@@ -153,24 +208,24 @@ timeout/panic/reconnect paths, and the CLI.
 - **One workflow** (`.github/workflows/ci.yml`) replaces the three that were
   split across `ci.yml`, `fuzz.yml` and `release.yml` — none of which had ever
   run, because all three were triggered on a `main` branch that does not exist
-  here. It runs on every push, on pull requests, and weekly. The `test` job is a
-  matrix over Ubuntu, macOS and Windows running `gofmt`, `go vet`, a
-  `CGO_ENABLED=0` build, `go test ./...` and `go test -race ./...`; the other
-  jobs lint, generate coverage and send it to Coveralls, fuzz all four targets,
-  run the `smbclient` interop suite, and cross-build for `linux/arm64`.
-- The macOS and Windows legs are `continue-on-error`, because the server is
-  Linux-only and they cannot build yet. They are kept as the signal that
-  portability drift has appeared; only the Linux leg gates anything.
+  here. It runs on every push, on pull requests, and weekly: `test` (Linux: the
+  whole suite, the race detector and the platform-mechanism report), `platform`
+  (macOS and Windows: the per-platform facility suite, run rather than compiled),
+  `lint`, `coverage`, `fuzz`, `interop` and `cross-build` (the module built and
+  vetted, tests included, for the BSDs and the other architectures). The
+  `continue-on-error` on the non-Linux legs went away with the port — see the
+  entry above for what runs where now, and why the BSDs are compile-verified
+  only.
 - **A release is gated.** `release` runs only on a `v*` tag and needs `lint`,
-  `coverage`, `test` and `fuzz`, so it is skipped rather than published when any
-  of them fails. It builds both static binaries, smoke-tests `--version` and
+  `coverage`, `test`, `platform`, `cross-build` and `fuzz`, so it is skipped
+  rather than published when any of them fails. It builds both static binaries, smoke-tests `--version` and
   `--check`, refuses a tag that disagrees with `Version` in `doc.go`, runs the
   benchmarks and puts their output at the top of the release description.
 - **`golangci-lint`** has a configuration now (`.golangci.yml`, schema v2) and
   the tree passes it at zero findings. Getting there fixed three real findings —
   an allocation in `UTF16LE`, a dead field in `krbStep`, and two unchecked
   `InotifyRmWatch` errors — and restated two deliberate test constructs instead
-  of suppressing them.
+  of suppressing them. The `InotifyRmWatch` calls now live in `pkg/watch`.
 - **`TestVersionMatchesChangelog`** is new: it pins the newest released
   `CHANGELOG.md` heading to `Version`, the same drift the release job refuses to
   publish.

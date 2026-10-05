@@ -39,10 +39,35 @@ should be read as claiming otherwise. Keep SECURITY.md honest about that.
 
 ## Platform and build
 
-- **Linux only.** The transport and filesystem layer use `SO_REUSEPORT`,
-  `inotify`, OFD byte-range locks, `statfs`, `futimens` and the kernel's
-  `splice(2)` path, all through `golang.org/x/sys/unix`. There is no
-  non-Linux build and adding one is not a goal.
+- **A supported platform set, with documented degradation.** The transport and
+  filesystem layer need four things Go does not provide: sharing a listening
+  port, watching a directory, locking a byte range and moving file bytes to a
+  socket. Each has a native answer on some platforms and none on others, so
+  `pkg/` holds one implementation per platform plus an honest fallback:
+
+  | facility | package | native | fallback |
+  |---|---|---|---|
+  | shared listening port | `pkg/reuseport` | `SO_REUSEPORT` (Linux, macOS, the BSDs) | one socket shared by every accept loop |
+  | directory watching | `pkg/watch` | `inotify` (Linux), `kqueue` (macOS, BSDs), `ReadDirectoryChangesW` (Windows) | polling the directory listing |
+  | byte-range locks | `pkg/rangelock` | OFD locks (Linux), `LockFileEx` (Windows) | the in-process registry alone |
+  | file → socket | `pkg/zerocopy` | `splice(2)` (Linux), `sendfile(2)` (macOS, BSDs) | a buffered copy |
+  | file metadata, timestamps, filesystem sizes | `pkg/fsutil` | `stat`/`utimensat`/`fstatfs` and their per-platform equivalents | `ErrUnsupported`, never an invented value |
+
+  **The rule for a new facility: degrade visibly, never silently.** A platform
+  gets the native mechanism where the mechanism is *sound*, and a fallback where
+  it is not — including where the option exists but means something dangerous
+  (`SO_REUSEADDR` on Windows lets another socket take the port, so it is never
+  set there; the listener asks for `SO_EXCLUSIVEADDRUSE` instead and the workers
+  share one socket). The fallback must be a real implementation, not a refusal, and what it
+  costs has to be written down in three places at once: the package's doc
+  comment, the `--list-platform` report (`introspect.go`), and the support table
+  in the README. A degradation an operator cannot see is a bug.
+- **Platform set**: Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly and
+  Windows build and pass `go vet`, and the `pkg/` tests run natively on Linux,
+  macOS and Windows. Everywhere else compiles to a stub that reports
+  `ErrUnsupported` (or the polling watcher) rather than failing to build; the
+  BSDs are build+vet verified in CI but not run there, which the README table
+  says.
 - **Pure Go, always.** No CGO, no `unsafe`, in any file that ships. CI builds
   with `CGO_ENABLED=0` and greps for both. If a feature seems to need a C
   library, that is a signal to implement it in Go (as was done for AES-CMAC,
@@ -69,14 +94,14 @@ should be read as claiming otherwise. Keep SECURITY.md honest about that.
 ## Architecture
 
 ```
-main ─ config (TOML) ─ NewServer ─ N workers (SO_REUSEPORT listeners)
+main ─ config (TOML) ─ NewServer ─ N workers (shared listeners: pkg/reuseport)
 each worker goroutine:
   Accept() ─► one goroutine per connection
                 ├─ reader goroutine: NBT framing ─► frames channel
                 ├─ driver goroutine: ProcessFrame per frame, responses batched
                 │                   into one write; zero-copy READ plans are
-                │                   served by header write + splice(file→socket)
-                ├─ notifier goroutine: inotify watches ─► deferred completions
+                │                   served by header write + pkg/zerocopy
+                ├─ notifier goroutine: pkg/watch watches ─► deferred completions
                 └─ deferred queue: server-initiated frames (lease breaks,
                                    CHANGE_NOTIFY completions) written by the
                                    driver goroutine, never concurrently
@@ -98,9 +123,8 @@ for where each concern lives:
 | `wire.go` | little-endian wire primitives (Reader/Writer, UTF-16LE) |
 | `smb2.go` | SMB2 header codec, compound dispatch, transform header, `ProcessFrame` |
 | `handlers.go` | command handlers (negotiate, session setup, tree, create, read/write, dir, info, lock, notify, ioctl, leases) |
-| `server.go` | transport: SO_REUSEPORT listeners, per-connection goroutines, zero-copy READ, worker mailboxes |
-| `zerocopy.go` | the splice(2) read path |
-| `notify.go` | inotify watcher backing CHANGE_NOTIFY |
+| `server.go` | transport: shared listeners, per-connection goroutines, zero-copy READ, worker mailboxes |
+| `notify.go` | CHANGE_NOTIFY plumbing on top of `pkg/watch` |
 | `session.go` | cross-connection session registry (multichannel) |
 | `lease.go` | file-keyed lease table and cross-worker break mailbox |
 | `vfs.go` | filesystem layer: path resolution, handle table, metadata |
@@ -113,6 +137,11 @@ for where each concern lives:
 | `introspect.go` | the published facts: the dialect table and floor, ciphers, per-config capabilities, live stats |
 | `netinfo.go` | interface enumeration for multichannel |
 | `status.go`, `log.go` | NTSTATUS codes and logging |
+| `pkg/reuseport/` | shared listening sockets: `SO_REUSEPORT` where it exists, one shared socket where it does not |
+| `pkg/watch/` | directory watching: inotify, kqueue, ReadDirectoryChangesW, polling |
+| `pkg/rangelock/` | byte-range locks: the in-process registry plus OFD/LockFileEx where available |
+| `pkg/zerocopy/` | file → socket: splice, sendfile, or a buffered copy |
+| `pkg/fsutil/` | portable file metadata, timestamps, filesystem sizes, read-ahead hints |
 | `cmd/` | the command-line entry point |
 | `docs/` | architecture, the SAMBA specification, benchmark, testing, tuning and security notes |
 | `bench/` | host scripts: benchmark suite, stress/soak, Windows interop |
@@ -126,9 +155,10 @@ LOGOFF, TREE_CONNECT/DISCONNECT (`IPC$` stub), CREATE (including `RqLs` lease
 contexts), CLOSE, FLUSH, READ (zero-copy or buffered), WRITE, QUERY_DIRECTORY
 (six information classes), QUERY_INFO (file, filesystem and a synthesized
 security descriptor), SET_INFO (rename, delete-on-close, truncate, timestamps),
-LOCK (OFD byte-range locks, all-or-nothing batches), IOCTL
+LOCK (per-handle byte-range locks, all-or-nothing batches), IOCTL
 (`FSCTL_VALIDATE_NEGOTIATE_INFO`, `FSCTL_QUERY_NETWORK_INTERFACE_INFO`),
-CHANGE_NOTIFY (real inotify-backed async completion), CANCEL, ECHO, compound
+CHANGE_NOTIFY (async completion from the platform's own directory watch), CANCEL,
+ECHO, compound
 requests, credit accounting, SMB3 transform-header encryption and SMB2/3 signing.
 
 Not implemented, and each has a reason recorded in `docs/` or `SECURITY.md`:
@@ -199,26 +229,39 @@ wherever `allow_guest` is set. `TestSessionSetupRefusesKerberos` pins that, and
   reachable, the per-connection panic guard contains it rather than taking the
   process down.
 - **Every client-controllable resource has a bound.** Add new ones to
-  `limits.go` with a comment explaining what a peer could otherwise do, and
+  `limits.go` — or, when the bound belongs to a facility, next to the code that
+  enforces it in `pkg/`, with `limits.go` naming it (see `rangelock.MaxRangesPerHandle`)
+  — with a comment explaining what a peer could otherwise do, and
   answer `STATUS_INSUFFICIENT_RESOURCES` when it is hit. Equally, every wait has
   a timeout, and an *idle* connection is never disconnected. [REVIEW.md](REVIEW.md)
   is the record of the review that established this.
 - **Offset discipline in the read path.** SMB reads are addressed by offset and
   a handle can be read concurrently from several channels of one session, so
-  file access uses positional I/O (`ReadAt`/`WriteAt`, explicit-offset
-  `splice(2)`). Nothing may depend on, or disturb, a file descriptor's own
-  position.
+  file access uses positional I/O (`ReadAt`/`WriteAt`, and an explicit offset to
+  `splice(2)`/`sendfile(2)` in `pkg/zerocopy`). Nothing may depend on, or
+  disturb, a file descriptor's own position.
+- **The platform layer lives in `pkg/`, and every facility is tested where it
+  runs.** A new syscall that some platform lacks goes behind a small interface
+  in its own `pkg/` package with one file per mechanism and a fallback for the
+  rest; a package reports what it got through a `Backend()` (or `Available()`)
+  accessor, `introspect.go` publishes it, and its tests run on every platform
+  the CI has a runner for rather than only on the one that motivated the code.
+  A test that asserts a mechanism-specific shape (a name in a notification, a
+  cross-process lock) must assert it only for the platforms that provide it, so
+  a documented difference stays a documented difference instead of becoming a
+  skipped or flaky test.
 - **Share the session lock briefly.** Trees and handles live behind the session
   lock; file I/O must not happen with it held.
 - **Document as you go.** Any perf-relevant change gets re-measured with the
   benchmarks and recorded in `docs/BENCHMARKS.md`; architecture changes update
   `docs/ARCHITECTURE.md` in the same change.
 - **Introspection is a contract.** The CLI describes the server from
-  `introspect.go` (`Dialects`, `Ciphers`, `Srv.Capabilities`, `Server.Stats`,
-  `AdvertisedInterfaces`) and never from strings written in `cmd/`. A new
-  dialect, cipher or capability goes in that file, with a test in
-  `introspect_test.go` pinning it to the code that acts on it — otherwise
-  `--check`, the banner and the man page drift apart.
+  `introspect.go` (`Dialects`, `Ciphers`, `Srv.Capabilities`,
+  `PlatformFacilities`, `PlatformName`, `Server.Stats`, `AdvertisedInterfaces`)
+  and never from strings written in `cmd/`. A new dialect, cipher, capability or
+  platform mechanism goes in that file, with a test in `introspect_test.go`
+  pinning it to the code that acts on it — otherwise `--check`, `--list-platform`,
+  the banner and the README support table drift apart.
 - **Commit style**: conventional commits (`feat:`, `fix:`, `perf:`, `docs:`,
   `chore:`), one logical change each, with `CHANGELOG.md` updated.
 
@@ -234,6 +277,15 @@ The dialect floor matters to the posture, so it is worth stating together with
 the rest: SMB 2.0.2 and 2.1 have **no encryption and no downgrade protection**,
 so `min_dialect = "3.0"` (or `encrypt = true`, which implies it) is the setting
 that removes both. `SECURITY.md` spells out the consequences.
+
+What the *platform* provides matters too, and it differs: locks are enforced
+between SMB clients everywhere (the registry is the server's own table) but only
+against other local processes on Linux and Windows, where the kernel has
+per-handle locks. That is the same caveat Samba states for `kernel oplocks`, and
+it is why the README tells you not to mix local and SMB access to one share.
+Even a fully degraded platform — polling notifications, buffered reads — keeps
+every *protocol* guarantee: signing, encryption, preauth integrity, the limits
+in `limits.go` and the panic guards are all pure Go and identical everywhere.
 
 No external security review has been done. The goal is a server that is safe to
 expose, but that goal is the direction of travel and not a warranty: until a

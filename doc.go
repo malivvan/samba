@@ -29,16 +29,31 @@
 // # Architecture
 //
 // A single process serves all shares. main resolves the TOML configuration into
-// a shared Srv context and starts N workers, each owning its own SO_REUSEPORT
-// listener; the kernel spreads accepted connections across them. Every
-// connection is handled by two goroutines: a reader that frames inbound NetBIOS
-// session messages, and a driver that processes them in batches, writes the
-// batched responses, and interleaves server-initiated frames (lease breaks and
+// a shared Srv context and starts N workers, each accepting independently from a
+// shared listening socket (or from its own, where the platform has SO_REUSEPORT,
+// in which case the kernel balances the connections). Every connection is
+// handled by two goroutines: a reader that frames inbound NetBIOS session
+// messages, and a driver that processes them in batches, writes the batched
+// responses, and interleaves server-initiated frames (lease breaks and
 // CHANGE_NOTIFY completions) queued from other goroutines.
 //
-// Large unsigned READs bypass userspace: the response header is written and the
-// file's cached pages are then streamed straight to the socket, which the Go
-// runtime performs with the kernel's splice machinery.
+// Large unsigned READs avoid a userspace copy where the platform allows it: the
+// response header is written and the file's cached pages are then streamed
+// straight to the socket — splice(2) on Linux, sendfile(2) on macOS and the
+// BSDs, a bounded buffered copy on Windows.
+//
+// # Platforms
+//
+// Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly BSD and Windows are
+// supported. The four facilities Go does not provide — a shared listening port,
+// directory watching, byte-range locks and file-to-socket copies — live in the
+// pkg/ subpackages, one implementation per mechanism and a documented fallback
+// for the rest: nothing above that layer is platform-dependent, and no platform
+// gets a weaker protocol. PlatformFacilities and PlatformName report which
+// mechanism a build actually got, and the README's support table is the map,
+// including the caveats (a lock not enforced against local processes on macOS
+// and the BSDs, a directory watcher that cannot name the entry that changed on
+// kqueue).
 //
 // # Library surface
 //

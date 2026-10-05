@@ -1,19 +1,29 @@
 package samba
 
 import (
-	"os"
 	"sync"
 
-	"golang.org/x/sys/unix"
+	"github.com/malivvan/samba/pkg/watch"
 )
 
-// inotify (Linux) event masks and CHANGE_NOTIFY action codes.
-
-// inMask is the set of inotify events a pended CHANGE_NOTIFY watches for.
-const inMask = unix.IN_CREATE | unix.IN_DELETE | unix.IN_MODIFY | unix.IN_ATTRIB |
-	unix.IN_CLOSE_WRITE | unix.IN_MOVED_FROM | unix.IN_MOVED_TO | unix.IN_DELETE_SELF
+// CHANGE_NOTIFY plumbing.
+//
+// The notifier owns one directory watcher per connection and the bookkeeping
+// that turns watcher notifications into CHANGE_NOTIFY completions. Which
+// mechanism actually observes the filesystem is pkg/watch's business: inotify on
+// Linux, kqueue on macOS and the BSDs, ReadDirectoryChangesW on Windows, and a
+// polling watcher on the platforms with none of those. The protocol layer above
+// this file is the same on every platform, which is the point of the split.
+//
+// The notifier runs on its own goroutine so a slow socket never delays watch
+// registration, and it never writes to the socket itself: completions are queued
+// as deferred frames for the connection goroutine, which is the only writer.
 
 // FILE_NOTIFY_INFORMATION action codes (MS-FSCC 2.4.37).
+//
+// The numbering is the protocol's, and pkg/watch uses the same numbering for its
+// own action codes, so a watcher event becomes a wire event by conversion rather
+// than by a lookup table. TestWatchActionsMatchTheWire pins the two together.
 const (
 	fileActionAdded      uint32 = 1
 	fileActionRemoved    uint32 = 2
@@ -22,11 +32,12 @@ const (
 	fileActionRenamedNew uint32 = 5
 )
 
-// watch is one registered inotify watch and the CHANGE_NOTIFY it belongs to.
-// Several watches may share a kernel watch descriptor (the same directory can
-// back several pends), so removal only drops the kernel watch with the last one.
-type watch struct {
-	wd   int
+// watchEntry is one pending CHANGE_NOTIFY and the watcher id it is registered
+// under. Several entries may share one id: the watcher counts references per
+// directory, so a client that pends many notifications on one directory costs
+// one kernel watch rather than one each.
+type watchEntry struct {
+	id   watch.ID
 	pend NotifyPend
 }
 
@@ -44,11 +55,7 @@ type notifyFired struct {
 	events []DirEvent
 }
 
-// notifier owns a connection's inotify instance, its live watches, and the
-// bookkeeping that turns kernel events into CHANGE_NOTIFY completions. It runs
-// on its own goroutine so a slow socket never delays watch registration, and it
-// never writes to the socket itself: completions are queued as deferred frames
-// for the connection goroutine, which is the only writer.
+// notifier owns a connection's directory watcher and its pending notifications.
 type notifier struct {
 	conn *conn
 	msgs chan notifyMsg
@@ -84,18 +91,24 @@ func (n *notifier) complete(d NotifyDone) {
 // stopNow shuts the watcher down.
 func (n *notifier) stopNow() { n.once.Do(func() { close(n.stop) }) }
 
-// run is the watcher goroutine.
+// run is the watcher goroutine. It owns the watcher and the entry list, so
+// nothing below needs a lock: registrations arrive on msgs, and notifications
+// arrive on the watcher's channel.
 func (n *notifier) run() {
-	var (
-		watches []watch
-		ifd     *os.File
-		evCh    chan []byte
-	)
-	defer func() {
-		if ifd != nil {
-			ifd.Close()
-		}
-	}()
+	// New is cheap and creates nothing: the watcher's own kernel resources are
+	// created by the first Add, so a connection that never pends a CHANGE_NOTIFY
+	// costs no descriptor and no goroutine beyond this one.
+	w := watch.New()
+	defer func() { _ = w.Close() }()
+
+	var entries []watchEntry
+	// fail completes a pend that could not be registered, so the client is not
+	// left waiting forever for a watch that does not exist.
+	fail := func(p NotifyPend) {
+		n.conn.deferFrame(pendingFrame{notify: &notifyFired{
+			pend: p, status: StatusInsufficientResources,
+		}})
+	}
 	for {
 		select {
 		case <-n.stop:
@@ -103,175 +116,81 @@ func (n *notifier) run() {
 		case m := <-n.msgs:
 			switch {
 			case m.add != nil:
-				if ifd == nil {
-					fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
-					if err != nil {
-						LogDebug("notify: inotify_init failed: %v", err)
-						n.conn.deferFrame(pendingFrame{notify: &notifyFired{
-							pend: *m.add, status: StatusInsufficientResources,
-						}})
-						continue
-					}
-					ifd = os.NewFile(uintptr(fd), "inotify")
-					evCh = make(chan []byte)
-					go readInotify(ifd, evCh, n.stop)
-				}
-				wd, err := unix.InotifyAddWatch(int(ifd.Fd()), m.add.Path, inMask)
+				id, err := w.Add(m.add.Path)
 				if err != nil {
-					LogDebug("notify: add_watch(%s) failed: %v", m.add.Path, err)
-					n.conn.deferFrame(pendingFrame{notify: &notifyFired{
-						pend: *m.add, status: StatusInsufficientResources,
-					}})
+					LogDebug("notify: watching %s failed: %v", m.add.Path, err)
+					fail(*m.add)
 					continue
 				}
-				LogDebug("notify pend on %s (wd %d)", m.add.Path, wd)
-				watches = append(watches, watch{wd: wd, pend: *m.add})
+				LogDebug("notify pend on %s (watch %d)", m.add.Path, id)
+				entries = append(entries, watchEntry{id: id, pend: *m.add})
 			case m.done != nil:
-				for i := range watches {
-					if watches[i].pend.AsyncID != m.done.AsyncID {
+				// Cancelled or the handle closed: drop the reference and answer
+				// with the status the caller asked for. An unknown id is not an
+				// error — the watch may already have fired. An AsyncID is unique
+				// to one operation, so at most one entry can match.
+				kept := entries[:0:0]
+				for _, e := range entries {
+					if e.pend.AsyncID != m.done.AsyncID {
+						kept = append(kept, e)
 						continue
 					}
-					w := watches[i]
-					watches = append(watches[:i], watches[i+1:]...)
-					if ifd != nil && !anyWatchWD(watches, w.wd) {
-						// Best effort: the watch may be gone already, and the
-						// completion reaches the client either way.
-						_, _ = unix.InotifyRmWatch(int(ifd.Fd()), uint32(w.wd))
-					}
+					_ = w.Remove(e.id)
 					n.conn.deferFrame(pendingFrame{notify: &notifyFired{
-						pend: w.pend, status: m.done.Status,
+						pend: e.pend, status: m.done.Status,
 					}})
-					break
 				}
+				entries = kept
 			}
-		case data, ok := <-evCh:
+		case nf, ok := <-w.Events():
 			if !ok {
-				evCh = nil
-				if ifd != nil {
-					ifd.Close()
-					ifd = nil
+				// The watcher stopped (its resources are gone); anything still
+				// pending would hang forever, so complete it with the
+				// "re-enumerate" answer.
+				for _, e := range entries {
+					n.conn.deferFrame(pendingFrame{notify: &notifyFired{
+						pend: e.pend, status: StatusNotifyEnumDir,
+					}})
 				}
-				continue
-			}
-			groups, selfGone := parseInotifyEvents(data)
-			fired := make([]notifyFired, 0, len(groups)+len(selfGone))
-			for wd, events := range groups {
-				for i := range watches {
-					if watches[i].wd != wd {
-						continue
-					}
-					fired = append(fired, notifyFired{pend: watches[i].pend, status: StatusSuccess, events: events})
-				}
-				kept := watches[:0]
-				for _, w := range watches {
-					if w.wd != wd {
-						kept = append(kept, w)
-					}
-				}
-				watches = kept
-				if ifd != nil {
-					// Best effort, exactly as in the DONE case above.
-					_, _ = unix.InotifyRmWatch(int(ifd.Fd()), uint32(wd))
-				}
-			}
-			for _, wd := range selfGone {
-				for i := range watches {
-					if watches[i].wd == wd {
-						fired = append(fired, notifyFired{pend: watches[i].pend, status: StatusSuccess})
-					}
-				}
-				kept := watches[:0]
-				for _, w := range watches {
-					if w.wd != wd {
-						kept = append(kept, w)
-					}
-				}
-				watches = kept
-			}
-			for i := range fired {
-				n.conn.deferFrame(pendingFrame{notify: &fired[i]})
-			}
-		}
-	}
-}
-
-func anyWatchWD(ws []watch, wd int) bool {
-	for _, w := range ws {
-		if w.wd == wd {
-			return true
-		}
-	}
-	return false
-}
-
-// readInotify pumps raw inotify reads into a channel until the instance closes.
-// The descriptor is created non-blocking, so the Go runtime poller parks this
-// goroutine instead of burning a thread, and Close unblocks it cleanly.
-func readInotify(f *os.File, out chan<- []byte, stop <-chan struct{}) {
-	defer close(out)
-	buf := make([]byte, 4096)
-	for {
-		n, err := f.Read(buf)
-		if n > 0 {
-			data := make([]byte, n)
-			copy(data, buf[:n])
-			select {
-			case out <- data:
-			case <-stop:
 				return
 			}
-		}
-		if err != nil {
-			return
+			entries = n.deliver(entries, nf, w)
 		}
 	}
 }
 
-// parseInotifyEvents decodes a raw inotify read into per-watch event lists plus
-// the watch descriptors whose directory went away.
-func parseInotifyEvents(data []byte) (groups map[int][]DirEvent, selfGone []int) {
-	groups = make(map[int][]DirEvent)
-	off := 0
-	for off+16 <= len(data) {
-		wd := int(le32(data[off : off+4]))
-		mask := le32(data[off+4 : off+8])
-		nameLen := int(le32(data[off+12 : off+16]))
-		var name string
-		if end := off + 16 + nameLen; end <= len(data) {
-			raw := data[off+16 : end]
-			for i, b := range raw {
-				if b == 0 {
-					raw = raw[:i]
-					break
-				}
-			}
-			name = string(raw)
-		}
-		off += 16 + nameLen
-
-		if mask&(unix.IN_DELETE_SELF|unix.IN_IGNORED|unix.IN_UNMOUNT) != 0 {
-			selfGone = append(selfGone, wd)
-			continue
-		}
-		var action uint32
-		switch {
-		case mask&unix.IN_CREATE != 0:
-			action = fileActionAdded
-		case mask&unix.IN_DELETE != 0:
-			action = fileActionRemoved
-		case mask&unix.IN_MOVED_FROM != 0:
-			action = fileActionRenamedOld
-		case mask&unix.IN_MOVED_TO != 0:
-			action = fileActionRenamedNew
-		default:
-			action = fileActionModified
-		}
-		if name != "" {
-			groups[wd] = append(groups[wd], DirEvent{Action: action, Name: name})
-		} else if _, ok := groups[wd]; !ok {
-			// Event without a name → make the client re-enumerate.
-			groups[wd] = nil
+// deliver completes every pending notification registered for one watcher id and
+// returns the entries that remain.
+//
+// A notification ends the pends it matches: SMB completes a CHANGE_NOTIFY once,
+// and the client re-issues it if it wants to keep watching. A watcher event
+// whose Events are empty means the mechanism could not attribute the change to a
+// name, which the protocol expresses as STATUS_NOTIFY_ENUM_DIR — the client is
+// told to re-enumerate rather than being handed an invented name.
+func (n *notifier) deliver(entries []watchEntry, nf watch.Notification, w watch.Watcher) []watchEntry {
+	var events []DirEvent
+	if nf.Events != nil {
+		events = make([]DirEvent, 0, len(nf.Events))
+		for _, ev := range nf.Events {
+			events = append(events, DirEvent{Action: uint32(ev.Action), Name: ev.Name})
 		}
 	}
-	return groups, selfGone
+	kept := entries[:0:0]
+	for _, e := range entries {
+		if e.id != nf.ID {
+			kept = append(kept, e)
+			continue
+		}
+		// The watcher has already released a gone watch itself, so only a live
+		// one needs its reference dropped.
+		if !nf.Gone {
+			_ = w.Remove(e.id)
+		}
+		LogDebug("notify complete aid=%d watch=%d events=%d gone=%v",
+			e.pend.AsyncID, nf.ID, len(events), nf.Gone)
+		n.conn.deferFrame(pendingFrame{notify: &notifyFired{
+			pend: e.pend, status: StatusSuccess, events: events,
+		}})
+	}
+	return kept
 }

@@ -3,7 +3,6 @@ package samba
 import (
 	"errors"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/malivvan/samba/pkg/fsutil"
+	"github.com/malivvan/samba/pkg/rangelock"
 )
 
 // Filesystem layer: path resolution, open-handle table, metadata mapping.
@@ -63,32 +63,38 @@ type Meta struct {
 	IsDir  bool
 }
 
-func metaFromFileInfo(fi os.FileInfo) Meta {
-	st, _ := fi.Sys().(*syscall.Stat_t)
-	isDir := fi.IsDir()
+// metaFromInfo converts the portable file metadata into the SMB view of it.
+//
+// The kernel's own view is used rather than os.FileInfo's, because SMB exposes
+// more than os.FileInfo carries: the allocated size, the link count and the
+// access and change times. pkg/fsutil is where the platforms' differences are
+// absorbed; by the time it gets here the values are already portable.
+func metaFromInfo(info fsutil.Info) Meta {
 	var attrs uint32
-	if isDir {
+	if info.IsDir {
 		attrs |= AttrDirectory
 	}
-	if fi.Mode().Perm()&0o200 == 0 {
+	if info.Mode.Perm()&0o200 == 0 {
 		attrs |= AttrReadonly
 	}
 	if attrs == 0 {
 		attrs = AttrArchive
 	}
-	m := Meta{IsDir: isDir, Attrs: attrs, Size: uint64(fi.Size())}
-	if st != nil {
-		m.Alloc = uint64(st.Blocks) * 512
-		m.Mtime = filetime(st.Mtim.Sec, st.Mtim.Nsec)
-		m.Atime = filetime(st.Atim.Sec, st.Atim.Nsec)
-		m.Ctime = filetime(st.Ctim.Sec, st.Ctim.Nsec)
-		m.Ino = st.Ino
-		m.Nlink = uint32(st.Nlink)
-	} else {
-		m.Mtime = timeToFiletime(fi.ModTime())
-		m.Atime = m.Mtime
-		m.Ctime = m.Mtime
+	m := Meta{
+		IsDir: info.IsDir,
+		Attrs: attrs,
+		Size:  uint64(info.Size),
+		Ino:   info.Ino,
+		Nlink: info.Nlink,
 	}
+	if info.Blocks > 0 {
+		m.Alloc = uint64(info.Blocks) * 512
+	} else if info.Size > 0 {
+		m.Alloc = (uint64(info.Size) + 511) &^ 511
+	}
+	m.Mtime = timeToFiletime(info.Mtime)
+	m.Atime = timeToFiletime(info.Atime)
+	m.Ctime = timeToFiletime(info.Ctime)
 	// No portable birth time; mtime is a sane stand-in for creation.
 	m.Crtime = m.Mtime
 	return m
@@ -105,20 +111,20 @@ func finalizeAttrs(attrs uint32, leaf string) uint32 {
 // statMeta stats path without following the final symlink's target semantics of
 // the caller: it follows symlinks, like a normal open would.
 func statMeta(path string) (Meta, error) {
-	fi, err := os.Stat(path)
+	info, err := fsutil.StatPath(path)
 	if err != nil {
 		return Meta{}, err
 	}
-	return metaFromFileInfo(fi), nil
+	return metaFromInfo(info), nil
 }
 
 // fstatMeta stats an open handle.
 func fstatMeta(f *os.File) (Meta, error) {
-	fi, err := f.Stat()
+	info, err := fsutil.StatFile(f)
 	if err != nil {
 		return Meta{}, err
 	}
-	return metaFromFileInfo(fi), nil
+	return metaFromInfo(info), nil
 }
 
 // resolvePath maps a share-relative SMB name (backslash separators) to a host
@@ -146,7 +152,9 @@ func resolvePath(root, smbName string) (string, string, uint32) {
 	return filepath.Join(append([]string{root}, parts...)...), rel.String(), StatusSuccess
 }
 
-// openRaw opens path with raw Linux open(2) flags.
+// openRaw opens path with an integer flag mask, so a caller can OR in
+// fsutil.DirOpenFlags (the platform's "must be a directory" flag) on the
+// platforms that have one.
 func openRaw(path string, flags int, perm os.FileMode) (*os.File, error) {
 	return os.OpenFile(path, flags, perm)
 }
@@ -199,57 +207,11 @@ func errnoOf(err error) syscall.Errno {
 	}
 }
 
-// LockKind selects the byte-range lock mode.
-type LockKind int
-
-const (
-	// LockShared is a shared (read) lock.
-	LockShared LockKind = iota
-	// LockExclusive is an exclusive (write) lock.
-	LockExclusive
-	// LockUnlock releases a range.
-	LockUnlock
-)
-
-// rangeLock takes or releases a byte-range lock. It uses open-file-description
-// locks so the per-handle semantics match SMB (two SMB handles on one file do
-// not conflict with themselves), and conflicts surface as EAGAIN/EACCES.
-func rangeLock(f *os.File, off, length uint64, kind LockKind) error {
-	start := int64(min(off, math.MaxInt64))
-	lLen := int64(min(length, uint64(math.MaxInt64)-uint64(start)))
-	fl := unix.Flock_t{Type: unix.F_UNLCK, Whence: io.SeekStart, Start: start, Len: lLen}
-	switch kind {
-	case LockShared:
-		fl.Type = unix.F_RDLCK
-	case LockExclusive:
-		fl.Type = unix.F_WRLCK
-	case LockUnlock:
-		fl.Type = unix.F_UNLCK
-	}
-	return unix.FcntlFlock(f.Fd(), unix.F_OFD_SETLK, &fl)
-}
-
-// adviseSequential hints the kernel to read this file ahead aggressively. For a
-// file server streaming large files that keeps the page cache warm ahead of the
-// copy to the socket, so reads from cold storage aren't latency-bound.
-// Best-effort: failures are ignored.
-func adviseSequential(f *os.File) {
-	_ = unix.Fadvise(int(f.Fd()), 0, 0, unix.FADV_SEQUENTIAL)
-}
-
-// fsSizes reports (total units, caller-available units, actually-free units,
-// sectors per unit, bytes per sector) for the filesystem backing f.
-func fsSizes(f *os.File) (total, avail, free uint64, sectorsPerUnit, bytesPerSector uint32, err error) {
-	var s unix.Statfs_t
-	if err = unix.Fstatfs(int(f.Fd()), &s); err != nil {
-		return 0, 0, 0, 0, 0, err
-	}
-	frsize := uint64(s.Frsize)
-	if frsize == 0 {
-		frsize = 512
-	}
-	return s.Blocks, s.Bavail, s.Bfree, max(uint32(frsize/512), 1), 512, nil
-}
+// Byte-range locks live in pkg/rangelock, which keeps the per-handle
+// bookkeeping SMB needs and adds the kernel's own lock where the platform has a
+// per-handle kind (Linux OFD, Windows LockFileEx). vfs.go does not wrap it: the
+// LOCK handler calls it directly, because it is the caller that knows whether
+// the handle was opened for writing — which is what an exclusive lock requires.
 
 // DirEnt is one directory entry in a snapshot.
 type DirEnt struct {
@@ -337,7 +299,14 @@ func (o *OpenFile) close() {
 // closed) *os.File rather than a torn value.
 func (o *OpenFile) closeFile() {
 	if o.File != nil {
-		o.closeOnce.Do(func() { o.File.Close() })
+		o.closeOnce.Do(func() {
+			// Locks do not outlive the handle that took them. On Linux and
+			// Windows the kernel would release them with the descriptor, but on
+			// the platforms where the process-wide registry is the only lock
+			// table nothing would, so it is done explicitly everywhere.
+			rangelock.Release(o.File)
+			o.File.Close()
+		})
 	}
 }
 
@@ -358,11 +327,11 @@ func dirSnapshot(of *OpenFile, pattern string) ([]DirEnt, error) {
 	}
 	for _, ent := range ents {
 		name := ent.Name()
-		fi, err := os.Lstat(filepath.Join(of.Path, name))
+		info, err := fsutil.LstatPath(filepath.Join(of.Path, name))
 		if err != nil {
 			continue
 		}
-		meta := metaFromFileInfo(fi)
+		meta := metaFromInfo(info)
 		meta.Attrs = finalizeAttrs(meta.Attrs, name)
 		out = append(out, DirEnt{Name: name, Meta: meta})
 	}

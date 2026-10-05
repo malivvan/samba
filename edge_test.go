@@ -4,11 +4,11 @@ import (
 	"crypto/aes"
 	"os"
 	"path/filepath"
-	"syscall"
+	"strconv"
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/malivvan/samba/pkg/fsutil"
 )
 
 func TestCCMAADPrefixForms(t *testing.T) {
@@ -27,13 +27,19 @@ func TestCCMAADPrefixForms(t *testing.T) {
 	if got := ccmAADPrefix(0x10000); len(got) != 6 {
 		t.Fatalf("0x10000 prefix = % x", got)
 	}
-	// Beyond 2^32 the 8-octet form is used.
-	got = ccmAADPrefix(1 << 33)
-	if len(got) != 10 || got[0] != 0xFF || got[1] != 0xFF {
-		t.Fatalf("large prefix = % x", got)
-	}
-	if got[9] != 0 {
-		t.Fatalf("large prefix value = % x", got)
+	// Beyond 2^32 the 8-octet form is used. The value is built at run time
+	// rather than written as a literal, because that literal does not fit an int
+	// on a 32-bit target — where the case is unreachable anyway, since a payload
+	// that long cannot be expressed.
+	if strconv.IntSize == 64 {
+		large := uint64(1) << 33
+		got = ccmAADPrefix(int(large))
+		if len(got) != 10 || got[0] != 0xFF || got[1] != 0xFF {
+			t.Fatalf("large prefix = % x", got)
+		}
+		if got[9] != 0 {
+			t.Fatalf("large prefix value = % x", got)
+		}
 	}
 }
 
@@ -156,8 +162,8 @@ func TestFsSizesOnClosedFile(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, _, err := fsSizes(f); err == nil {
-		t.Fatal("fsSizes on a closed descriptor must fail")
+	if _, _, _, _, _, err := fsutil.Sizes(f, "closed"); err == nil {
+		t.Fatal("Sizes on a closed descriptor must fail")
 	}
 	if _, err := fstatMeta(f); err == nil {
 		t.Fatal("fstatMeta on a closed descriptor must fail")
@@ -267,13 +273,7 @@ func TestConnWriteStallAborts(t *testing.T) {
 
 	local, _ := socketPair(t)
 	// Shrink the send buffer so a large write blocks quickly.
-	if sc, ok := local.(syscall.Conn); ok {
-		if raw, err := sc.SyscallConn(); err == nil {
-			_ = raw.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4096)
-			})
-		}
-	}
+	setWriteBuffer(local, 4096)
 	c := &conn{nc: local}
 	// Nobody reads from peer, so a megabyte cannot be delivered. The write must
 	// fail promptly (bounded by the stall budget) rather than block forever.

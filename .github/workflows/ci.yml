@@ -1,14 +1,35 @@
-# The one CI workflow: the unit/integration suite on all three desktop
-# platforms, the race detector, lint, coverage, fuzzing, the SMB client interop
-# suite, and the tagged release.
+# The one CI workflow: the unit/integration suite, the per-platform facility
+# suite, the race detector, lint, coverage, fuzzing, the cross-platform builds,
+# the SMB client interop suite, and the tagged release.
 #
-# A note on the test matrix. This server is Linux-only by design — the transport
-# and filesystem layer use SO_REUSEPORT, inotify, splice, OFD byte-range locks,
-# futimens and statfs through golang.org/x/sys/unix — so the macOS and Windows
-# legs do not build today. They still run on every push, because they are the
-# signal that would tell us the moment a portable path appears, but they are
-# `continue-on-error` and must never gate lint, coverage or the release. Linux
-# is the gate.
+# A note on the test matrix, because what runs where is a deliberate decision
+# rather than a convenience.
+#
+# The server needs four facilities from the host that pure Go does not provide —
+# sharing a listening port, watching a directory, locking a byte range, moving
+# file bytes to a socket — plus the file metadata, timestamps and filesystem
+# sizes the protocol reports. They live in pkg/, one implementation per platform
+# and a documented fallback for the rest (the README support table is the map),
+# so the *platform-specific* code is the pkg/ tree:
+#
+#   * `test` runs everything on Linux: the whole suite, race detector, the
+#     interop suite and the release gate are here, because Linux is the platform
+#     with all four mechanisms native.
+#   * `platform` runs `go test ./pkg/...` on macOS and Windows, which *executes*
+#     kqueue, sendfile(2), fstatfs, futimes(2), ReadDirectoryChangesW,
+#     LockFileEx and the FILE_FS_SIZE_INFORMATION path rather than only compiling
+#     them. This leg gates: a platform-specific regression is a regression.
+#   * `cross-build` compiles and `go vet`s the whole module — tests included, so
+#     the test files must be portable too — for the BSDs and the other
+#     architectures, which cannot be run on a GitHub-hosted runner. Their code is
+#     compile-verified, not runtime-verified, and the README says so instead of
+#     implying otherwise.
+#
+# No third-party action is used for the BSD legs. Booting a real FreeBSD/OpenBSD/
+# NetBSD VM (vmactions/*) would execute them, and it is the obvious next step,
+# but it means adding an unreviewed third-party action to a CI that this project
+# treats as part of its supply chain. That trade-off is recorded in
+# docs/TESTING.md and ROADMAP.md rather than taken unilaterally here.
 
 name: CI
 
@@ -34,17 +55,9 @@ jobs:
   # Build, test and race-test the whole module — the package and cmd —
   # on each of the three desktop platforms.
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: test (linux, full)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    # See the header: the non-Linux legs are informational. Job-level
-    # continue-on-error also keeps them out of the `needs` result below, so a
-    # failing Windows or macOS leg cannot block the release.
-    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -64,6 +77,52 @@ jobs:
         run: go test ./...
       - name: Test under the race detector
         run: go test -race ./...
+      # The mechanism this platform is supposed to have, asserted rather than
+      # assumed: a build that silently landed on a fallback would otherwise pass
+      # every test above.
+      - name: Platform facilities
+        run: |
+          go run ./cmd --list-platform
+          out=$(go run ./cmd --list-platform)
+          for want in SO_REUSEPORT inotify OFD splice; do
+            case "$out" in
+              *"$want"*) ;;
+              *) echo "::error::linux lost the $want mechanism"; exit 1 ;;
+            esac
+          done
+
+  # The per-platform facility suite. Running it — rather than only compiling for
+  # these platforms — is what catches a regression in kqueue, in ReadDirectory-
+  # ChangesW, in LockFileEx, in the POSIX lock fallback or in the file-metadata
+  # mappings, none of which Linux exercises.
+  platform:
+    name: platform facilities (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet (everything, tests included)
+        run: go vet ./...
+      - name: Build (static, CGO disabled)
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath ./...
+      - name: Test the platform facilities
+        run: go test ./pkg/...
+      - name: Report the mechanisms this platform actually got
+        shell: bash
+        run: go run ./cmd --list-platform
 
   # golangci-lint (.golangci.yml) plus the source-level invariants that make the
   # rest of the security posture meaningful.
@@ -177,22 +236,46 @@ jobs:
           ./bench/interop-smbclient.sh ./samba
 
   cross-build:
-    name: cross-build (linux/arm64)
+    name: cross-build (${{ matrix.goos }}/${{ matrix.goarch }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every platform whose facilities are supposed to be native, plus the
+          # architectures whose field widths differ (a 32-bit BSD is where the
+          # uint32 kevent ident and the 32-bit Statvfs_t live), plus Solaris as
+          # the one platform that takes every fallback path at once.
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: 386 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: freebsd, goarch: amd64 }
+          - { goos: freebsd, goarch: arm64 }
+          - { goos: openbsd, goarch: amd64 }
+          - { goos: netbsd, goarch: amd64 }
+          - { goos: netbsd, goarch: arm }
+          - { goos: dragonfly, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: solaris, goarch: amd64 }
+          - { goos: js, goarch: wasm }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # The package is Linux-only by design, so this only proves the whole
-      # module still compiles for the other supported architecture.
-      - name: linux/arm64
+      # `go vet` type-checks the test files too, so this is also what keeps the
+      # suite portable: a test that reaches for a Linux-only syscall fails here
+      # rather than in someone's tree.
+      - name: Build and vet
         env:
-          GOOS: linux
-          GOARCH: arm64
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-        run: go build -trimpath ./...
+        run: |
+          go build -trimpath ./...
+          go vet ./...
 
   # A tag publishes a release, but only once lint, coverage, the tests (with the
   # race detector) and the fuzzers have passed. `needs` makes that an implicit
@@ -201,7 +284,7 @@ jobs:
   release:
     name: release ${{ github.ref_name }}
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [lint, coverage, test, fuzz]
+    needs: [lint, coverage, test, platform, cross-build, fuzz]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:

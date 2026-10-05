@@ -30,6 +30,16 @@ const (
 	maxSearchPatternRunes = 255
 )
 
+// Bounds that belong to a facility and so live beside the code that enforces
+// them, named here so this file stays the one place to look for "what is
+// bounded":
+//
+//   - rangelock.MaxRangesPerHandle and rangelock.MaxRangesTotal bound the
+//     byte-range locks one handle, and the server, may hold. A LOCK request may
+//     carry 64 ranges and a client may repeat it, so without them a peer could
+//     grow the lock table — the server's own *and* the kernel's — without limit.
+//     Exceeding either answers STATUS_INSUFFICIENT_RESOURCES.
+//
 // Per-client limits that tests shorten. Each one exists because the
 // corresponding resource is otherwise client-controllable without bound; the
 // values are generous enough that no real client notices them.
@@ -52,8 +62,9 @@ var (
 	// maxTreesPerSession bounds the share connections one session may hold.
 	maxTreesPerSession = 1 << 12
 	// maxNotifyWatchesPerConn bounds the pending CHANGE_NOTIFY operations on one
-	// connection. Each one costs an inotify watch, and the kernel's per-user
-	// watch limit is shared with every other process on the host.
+	// connection. Each one costs a watch in the platform's own table (inotify,
+	// kqueue, a completion port) and that budget is shared with every other
+	// process on the host; several pends on one directory share one watch.
 	maxNotifyWatchesPerConn = 256
 	// maxLeasesPerFile bounds the read-caching leases held on one file. Leases
 	// with handle-caching outlive CLOSE, so without a bound a client could grow

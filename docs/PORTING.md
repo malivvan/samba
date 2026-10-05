@@ -24,8 +24,8 @@ were kept as-is rather than "fixed".
 | `src/krb5.rs` | — | Kerberos was ported, then removed: see "Kerberos was removed" below |
 | `src/smb2/mod.rs` | `smb2.go` | Header codec, compound dispatch, transform header, `ProcessFrame` |
 | `src/smb2/handlers.rs` | `handlers.go` | Every command handler |
-| `src/uring.rs` | `server.go`, `notify.go`, `zerocopy.go` | The transport, rewritten (below) |
-| `src/main.rs` | `cmd/main.go` | Same core flags (`--config`, `--check`, `--version`), plus `--dump-config`, `--list-dialects`, `--list-ciphers`, `--list-interfaces` and `--log-level`/`--listen`/`--workers` overrides |
+| `src/uring.rs` | `server.go`, `notify.go`, `pkg/reuseport`, `pkg/zerocopy` | The transport, rewritten (below); the platform facilities now live behind `pkg/` rather than in the port's own files |
+| `src/main.rs` | `cmd/main.go` | Same core flags (`--config`, `--check`, `--version`), plus `--dump-config`, `--list-dialects`, `--list-ciphers`, `--list-interfaces`, `--list-platform` and `--log-level`/`--listen`/`--workers` overrides |
 | `src/lib.rs` | `doc.go` | Package documentation and the version constant |
 | `fuzz/fuzz_targets/*` | `fuzz_test.go` | cargo-fuzz → native Go fuzzing (four targets) |
 | `bench/*` | `bench/*` | The same host scripts, adapted to this binary |
@@ -44,15 +44,16 @@ terms while preserving every *behavioural* property that matters:
 
 | Behaviour | Original | This package |
 |---|---|---|
-| N workers, kernel-balanced accepts | one `SO_REUSEPORT` listener per ring | one `SO_REUSEPORT` listener per worker goroutine |
+| N workers, kernel-balanced accepts | one `SO_REUSEPORT` listener per ring | `pkg/reuseport`: one `SO_REUSEPORT` listener per worker where the platform has it, one shared listener where it does not (Windows) |
 | One transmit stream per connection | completion-driven state machine | one driver goroutine (the only writer) |
 | Batched responses per wakeup | all complete frames in the rx buffer, 1 MiB watermark | `processBatch`: up to 64 frames or the 1 MiB watermark |
-| Zero-copy read | `splice(file→pipe)` → `send(hdr, MSG_MORE)` → `splice(pipe→socket)` | header write → `splice(file→pipe)` → `splice(pipe→socket)`, all with an explicit file offset |
+| Zero-copy read | `splice(file→pipe)` → `send(hdr, MSG_MORE)` → `splice(pipe→socket)` | `pkg/zerocopy`: header write → `splice(file→pipe)` → `splice(pipe→socket)` on Linux, one `sendfile(2)` on macOS and the BSDs, a buffered copy on Windows — all with an explicit offset |
 | Buffered send for signed/encrypted | `send`/`send_zc` | `Write` |
 | `send_zc` for large buffered sends | `IORING_OP_SEND_ZC` | not ported: Go has no userspace `MSG_ZEROCOPY` path, and the copy it saves is the one covered by the splice read path |
 | Multishot accept, SQPOLL, core pinning | ring features / `sched_setaffinity` | accept loop; the two ring-only knobs were dropped (below) |
 | Cross-worker lease breaks | per-worker eventfd polled in the ring | per-worker mailbox goroutine + each connection's deferred queue |
-| CHANGE_NOTIFY | inotify fd read registered in the ring | inotify fd wrapped in `*os.File`, read by a watcher goroutine (the runtime poller parks it) |
+| CHANGE_NOTIFY | inotify fd read registered in the ring | `pkg/watch`: inotify on Linux, kqueue on macOS and the BSDs, `ReadDirectoryChangesW` on Windows, a polling watcher elsewhere; the Linux backend wraps the fd in `*os.File` so the runtime poller parks its reader |
+| Byte-range locks | OFD locks | `pkg/rangelock`: OFD locks on Linux and `LockFileEx` on Windows, on top of an in-process registry that is authoritative for SMB's per-handle semantics |
 
 Two configuration keys disappeared with the ring: `sqpoll` and `core_pinning`.
 Neither has a Go equivalent worth faking (the runtime scheduler owns thread

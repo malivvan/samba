@@ -1,7 +1,6 @@
 package samba
 
 import (
-	"context"
 	"errors"
 	"io"
 	"net"
@@ -9,22 +8,28 @@ import (
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"github.com/malivvan/samba/pkg/reuseport"
+	"github.com/malivvan/samba/pkg/zerocopy"
 )
 
-// Transport: SO_REUSEPORT listeners, one goroutine per connection, and a
-// zero-copy READ path.
+// Transport: shared listeners, one goroutine per connection, and a READ path
+// that avoids copying the file's bytes where the platform allows it.
 //
 // This replaces the original io_uring reactor. The behavioural contract is the
-// same — N workers each own a SO_REUSEPORT listener, every connection is
-// served by a single serialized transmit stream, responses to all frames that
-// arrived together are batched into one write, and large unsigned READs bypass
-// userspace so file pages reach the socket through the kernel's splice path —
-// but the mechanism is idiomatic Go: the runtime netpoller instead of a ring,
-// goroutines instead of completion state machines.
+// same — N workers each accept independently, every connection is served by a
+// single serialized transmit stream, responses to all frames that arrived
+// together are batched into one write, and large unsigned READs bypass userspace
+// so file pages reach the socket through the kernel's own copy path — but the
+// mechanism is idiomatic Go: the runtime netpoller instead of a ring, goroutines
+// instead of completion state machines.
+//
+// The two platform-dependent pieces are not coded here. pkg/reuseport decides
+// whether the workers get one socket each (SO_REUSEPORT, so the kernel balances
+// the accepts) or share one, and pkg/zerocopy chooses between splice(2),
+// sendfile(2) and a buffered copy. This file only ever sees a net.Listener and a
+// net.Conn, which is what keeps the transport itself portable.
 
 // Transport tuning constants.
 const (
@@ -157,23 +162,32 @@ func NewServer(cfg *Config) (*Server, error) {
 // Srv exposes the resolved shared context (used by tests).
 func (s *Server) Srv() *Srv { return s.srv }
 
-// Start binds every worker's listener and starts its accept loop.
+// Start binds the listeners and starts every worker's accept loop.
 //
 // It reports an error if the server has already been stopped: starting workers
 // that nothing will ever shut down would leave Wait blocked forever.
+//
+// How many sockets there are depends on the platform, and pkg/reuseport decides
+// it: with SO_REUSEPORT every worker gets its own socket on the same address and
+// the kernel balances accepts between them, and without it — Windows has no
+// equivalent — one socket is shared by all the accept loops. Either way every
+// worker accepts independently, so the only difference is whether the kernel or
+// the runtime's accept mutex does the spreading.
 func (s *Server) Start() error {
 	select {
 	case <-s.stop:
 		return errors.New("samba: the server has already been stopped")
 	default:
 	}
-	for _, w := range s.workers {
-		ln, err := listenReusePort(w.addr)
-		if err != nil {
-			s.Stop()
-			return err
-		}
-		w.setListener(ln)
+	listeners, err := reuseport.Listeners(len(s.workers), "tcp", s.workers[0].addr)
+	if err != nil {
+		s.Stop()
+		return err
+	}
+	for i, w := range s.workers {
+		// One socket means every worker shares it; several mean each worker owns
+		// one, in order.
+		w.setListener(listeners[i%len(listeners)])
 		s.wg.Add(1)
 		go func(w *worker) {
 			defer s.wg.Done()
@@ -225,31 +239,6 @@ func (s *Server) Stop() {
 
 // Wait blocks until every worker and every connection goroutine has finished.
 func (s *Server) Wait() { s.wg.Wait() }
-
-// listenReusePort binds a TCP listener with SO_REUSEADDR + SO_REUSEPORT so every
-// worker can share the same port and the kernel spreads connections across
-// them.
-func listenReusePort(addr string) (net.Listener, error) {
-	lc := net.ListenConfig{
-		Control: func(_, _ string, c syscall.RawConn) error {
-			var serr error
-			err := c.Control(func(fd uintptr) {
-				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-					serr = err
-					return
-				}
-				if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-					serr = err
-				}
-			})
-			if err != nil {
-				return err
-			}
-			return serr
-		},
-	}
-	return lc.Listen(context.Background(), "tcp", addr)
-}
 
 // worker owns one SO_REUSEPORT listener and the connections accepted from it.
 type worker struct {
@@ -343,8 +332,7 @@ func (w *worker) acceptOnce() (keepGoing bool) {
 		// SMB request/response benefits from disabling Nagle.
 		_ = tc.SetNoDelay(true)
 	}
-	tcp, _ := nc.(*net.TCPConn)
-	c := w.newConn(nc, tcp)
+	c := w.newConn(nc)
 	LogDebug("worker %d: new connection (slot %d)", w.id, c.idx)
 	started = true
 	if w.wg != nil {
@@ -404,7 +392,7 @@ func (w *worker) deliverBreak(b BreakMsg) {
 	c.deferred.push(pendingFrame{brk: &brk})
 }
 
-func (w *worker) newConn(nc net.Conn, tcp *net.TCPConn) *conn {
+func (w *worker) newConn(nc net.Conn) *conn {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	var idx int
@@ -421,7 +409,6 @@ func (w *worker) newConn(nc net.Conn, tcp *net.TCPConn) *conn {
 		w:        w,
 		srv:      w.srv,
 		nc:       nc,
-		tcp:      tcp,
 		idx:      idx,
 		gen:      gen,
 		pc:       NewProtoConn(w.srv, w.id, idx, gen),
@@ -469,8 +456,6 @@ type conn struct {
 	w   *worker
 	srv *Srv
 	nc  net.Conn
-	// tcp is the typed connection, required by the zero-copy splice path.
-	tcp *net.TCPConn
 	idx int
 	gen uint16
 	pc  *ProtoConn
@@ -662,9 +647,10 @@ func (c *conn) serviceNotify() {
 	}
 }
 
-// sendRead serves a validated zero-copy READ: it writes the response header and
-// then copies the file's bytes straight to the socket, which the Go runtime
-// performs with the kernel splice path (no userspace copy of the file data).
+// sendRead serves a validated READ: it writes the response header and then hands
+// the file's bytes to pkg/zerocopy, which moves them with the kernel's own copy
+// path where the platform has one (splice(2) on Linux, sendfile(2) on macOS and
+// the BSDs) and through a bounded userspace buffer where it does not.
 func (c *conn) sendRead(plan *ZcReadPlan) bool {
 	// The plan holds a reference to its handle (taken under the session lock) so
 	// a concurrent CLOSE cannot close the descriptor mid-read. Give it back on
@@ -691,9 +677,9 @@ func (c *conn) sendRead(plan *ZcReadPlan) bool {
 	if !c.write(hdr.Bytes()) {
 		return false
 	}
-	// Stream the payload straight from the file to the socket. Reads are
-	// addressed by offset, so the handle's own position is never touched.
-	if err := spliceFileToConn(c.tcp, plan.File, int64(plan.Offset), int(n), stallTimeout); err != nil {
+	// Stream the payload from the file to the socket. Reads are addressed by
+	// offset, so the handle's own position is never touched.
+	if err := zerocopy.Send(c.nc, plan.File, int64(plan.Offset), int(n), stallTimeout); err != nil {
 		// The header already promised n bytes, so the response stream is
 		// unusable: drop the connection.
 		LogDebug("zerocopy: read failed (%v)", err)

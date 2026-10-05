@@ -2,8 +2,14 @@ package samba
 
 import (
 	"net"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/malivvan/samba/pkg/rangelock"
+	"github.com/malivvan/samba/pkg/reuseport"
+	"github.com/malivvan/samba/pkg/watch"
+	"github.com/malivvan/samba/pkg/zerocopy"
 )
 
 // The introspection API exists so the CLI, the docs and the code that acts on
@@ -296,4 +302,135 @@ func TestServerStats(t *testing.T) {
 	}
 
 	c.close(dfid)
+}
+
+// TestPlatformFacilitiesMatchThePackages pins the platform report to the
+// packages that implement the mechanisms. The report exists so an operator can
+// see which mechanism this build got; if it were written out as strings here it
+// would keep claiming, say, splice(2) on a host that fell back to the buffered
+// copy — which is exactly the silent downgrade the report is for.
+func TestPlatformFacilitiesMatchThePackages(t *testing.T) {
+	got := PlatformFacilities()
+	if len(got) != 4 {
+		t.Fatalf("PlatformFacilities() reports %d mechanisms, want 4", len(got))
+	}
+	byName := make(map[string]Facility, len(got))
+	for _, f := range got {
+		if _, dup := byName[f.Name]; dup {
+			t.Errorf("facility %q is reported twice", f.Name)
+		}
+		if f.Detail == "" {
+			t.Errorf("facility %q has no detail", f.Name)
+		}
+		byName[f.Name] = f
+	}
+
+	// Listeners: the fallback is a single shared socket.
+	listen, ok := byName["platform listeners"]
+	if !ok {
+		t.Fatal("the listener mechanism is not reported")
+	}
+	if listen.Native != reuseport.Available() {
+		t.Errorf("listeners report native=%v, reuseport.Available()=%v",
+			listen.Native, reuseport.Available())
+	}
+
+	// Change notification: the mechanism name is the package's own.
+	notify := byName["platform notify"]
+	if notify.Detail != watch.Backend() {
+		t.Errorf("notify detail = %q, watch.Backend() = %q", notify.Detail, watch.Backend())
+	}
+	if notify.Native != watch.Supported() {
+		t.Errorf("notify reports native=%v, watch.Supported()=%v", notify.Native, watch.Supported())
+	}
+
+	// Locks: the mechanism name is the package's own, and "in-process" is the
+	// one that is a degradation rather than a second native mechanism.
+	locks := byName["platform locks"]
+	if locks.Detail != rangelock.Backend() {
+		t.Errorf("lock detail = %q, rangelock.Backend() = %q", locks.Detail, rangelock.Backend())
+	}
+	if want := rangelock.Backend() != "in-process"; locks.Native != want {
+		t.Errorf("locks report native=%v, want %v for backend %q", locks.Native, want, rangelock.Backend())
+	}
+	if locks.Native && !strings.Contains(lockDetail(), "locks") {
+		t.Errorf("the lock capability detail %q does not name the mechanism", lockDetail())
+	}
+	if !locks.Native && !strings.Contains(lockDetail(), "local processes") {
+		t.Errorf("the lock capability detail %q must warn that local processes are not covered", lockDetail())
+	}
+
+	// Zero-copy reads: same rule, plus the runtime fallback counter.
+	copyF := byName["platform copy"]
+	if copyF.Detail != zerocopy.Backend() {
+		t.Errorf("copy detail = %q, zerocopy.Backend() = %q", copyF.Detail, zerocopy.Backend())
+	}
+	if want := zerocopy.Backend() != "buffered"; copyF.Native != want {
+		t.Errorf("copy reports native=%v, want %v for backend %q", copyF.Native, want, zerocopy.Backend())
+	}
+	if copyF.Fallbacks != zerocopy.Fallbacks() {
+		t.Errorf("copy reports %d fallbacks, the package has %d", copyF.Fallbacks, zerocopy.Fallbacks())
+	}
+	if _, ok := byName["platform copy"]; !ok {
+		t.Error("the copy mechanism is not reported")
+	}
+
+	// The platform name is the GOOS/GOARCH spelling the support table uses.
+	if want := runtime.GOOS + "/" + runtime.GOARCH; PlatformName() != want {
+		t.Errorf("PlatformName() = %q, want %q", PlatformName(), want)
+	}
+}
+
+// TestCapabilitiesNameTheHostMechanism checks that a capability whose behaviour
+// depends on the host describes the mechanism this build actually has — the
+// difference between "byte-range locks: on" and "locks not enforced against local
+// processes".
+func TestCapabilitiesNameTheHostMechanism(t *testing.T) {
+	// Every backend a package can report must have a phrase in the capability
+	// detail, so a platform can never end up describing a mechanism it does not
+	// have. The mapping is explicit rather than "the detail contains the backend
+	// name", because the capability text is prose ("open-file-description locks"
+	// for the backend reported as "OFD").
+	lockPhrase := map[string]string{
+		"OFD":        "open-file-description locks",
+		"LockFileEx": "LockFileEx locks",
+		"in-process": "local processes",
+	}
+	if want, ok := lockPhrase[rangelock.Backend()]; !ok {
+		t.Fatalf("rangelock.Backend() = %q has no phrase in the capability detail", rangelock.Backend())
+	} else if !strings.Contains(lockDetail(), want) {
+		t.Errorf("the lock detail %q does not mention %q", lockDetail(), want)
+	}
+
+	notifyPhrase := map[string]string{
+		"inotify":               "inotify",
+		"ReadDirectoryChangesW": "ReadDirectoryChangesW",
+		"kqueue":                "kqueue",
+		"poll":                  "polling",
+	}
+	if want, ok := notifyPhrase[watch.Backend()]; !ok {
+		t.Fatalf("watch.Backend() = %q has no phrase in the capability detail", watch.Backend())
+	} else if !strings.Contains(notifyDetail(), want) {
+		t.Errorf("the notify detail %q does not mention %q", notifyDetail(), want)
+	}
+
+	copyPhrase := map[string]string{
+		"splice":   "splice(2)",
+		"sendfile": "sendfile(2)",
+		"buffered": "buffered copy",
+	}
+	if want, ok := copyPhrase[zerocopy.Backend()]; !ok {
+		t.Fatalf("zerocopy.Backend() = %q has no phrase in the capability detail", zerocopy.Backend())
+	} else if !strings.Contains(zeroCopyDetail(), want) {
+		t.Errorf("the zero-copy detail %q does not mention %q", zeroCopyDetail(), want)
+	}
+
+	// And the platform whose mechanisms the README table names explicitly must
+	// describe exactly those, because that is the claim the table makes.
+	if runtime.GOOS == "linux" {
+		if rangelock.Backend() != "OFD" || watch.Backend() != "inotify" || zerocopy.Backend() != "splice" {
+			t.Errorf("Linux reports %s/%s/%s, want OFD/inotify/splice",
+				rangelock.Backend(), watch.Backend(), zerocopy.Backend())
+		}
+	}
 }

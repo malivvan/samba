@@ -8,12 +8,13 @@
 // statically linkable and memory safe.
 //
 // Besides serving, the command is a window onto everything the package can do:
-// --check reports the resolved configuration and every capability the server
-// would advertise, --dump-config prints the resolved configuration, the
-// --list-* flags report the negotiation facts, and the startup banner logs all
-// of it. Those reports come from the library's introspection API
-// (samba.Capabilities, samba.Dialects, samba.Ciphers), never from strings
-// duplicated here, so the CLI cannot drift from the server it describes.
+// --check reports the resolved configuration, every capability the server would
+// advertise and the platform mechanisms it was built to use, --dump-config prints
+// the resolved configuration, the --list-* flags report the negotiation facts,
+// and the startup banner logs all of it. Those reports come from the library's
+// introspection API (samba.Capabilities, samba.Dialects, samba.Ciphers,
+// samba.PlatformFacilities), never from strings duplicated here, so the CLI cannot
+// drift from the server it describes.
 //
 // Usage:
 //
@@ -49,6 +50,9 @@ const help = `samba — a from-scratch SMB2/SMB3 file server.
       --list-ciphers      print the SMB3 ciphers it supports and exit
       --list-interfaces   print the multichannel interface advertisement and
                           exit
+      --list-platform     print the platform mechanisms this build uses
+                          (listeners, change notification, locks, zero-copy
+                          reads) and exit
       --log-level <n>     override log_level: 0 warn, 1 info, 2 debug
       --listen <addr>     override listen
       --workers <n>       override workers (0 = one per CPU core)
@@ -77,6 +81,7 @@ type options struct {
 	listDialects   bool
 	listCiphers    bool
 	listInterfaces bool
+	listPlatform   bool
 	help           bool
 	version        bool
 	logLevel       int
@@ -108,6 +113,9 @@ func run(args []string, stdout, stderr io.Writer, sigs <-chan os.Signal) int {
 		return 0
 	case opt.listCiphers:
 		printCiphers(stdout)
+		return 0
+	case opt.listPlatform:
+		printPlatform(stdout)
 		return 0
 	}
 
@@ -199,6 +207,8 @@ func parseArgs(args []string) (options, error) {
 			opt.listCiphers = true
 		case "--list-interfaces":
 			opt.listInterfaces = true
+		case "--list-platform":
+			opt.listPlatform = true
 		case "--version", "-V":
 			opt.version = true
 		case "--help", "-h":
@@ -274,6 +284,16 @@ func describe(cfg *samba.Config, srv *samba.Server, workers int) []string {
 			state = "on"
 		}
 		lines = append(lines, line(c.Name, fmt.Sprintf("%s %s", state, c.Detail)))
+	}
+	// The platform mechanisms a capability depends on are reported next to the
+	// capabilities, so a `--check` on a host whose kernel cannot do one of them
+	// says so instead of implying the server has it.
+	for _, f := range samba.PlatformFacilities() {
+		how := "native"
+		if !f.Native {
+			how = "fallback"
+		}
+		lines = append(lines, line(f.Name, fmt.Sprintf("%s %s", how, f.Detail)))
 	}
 	for _, sh := range cfg.Shares {
 		mode := "read-write"
@@ -357,6 +377,32 @@ func printCiphers(w io.Writer) {
 	for _, a := range samba.SigningAlgorithms() {
 		fmt.Fprintf(w, "  %s\n", a)
 	}
+}
+
+// printPlatform reports the mechanisms the host provides, straight from the
+// library.
+//
+// It exists because four parts of the server cannot be implemented in Go alone —
+// sharing a listening port, watching a directory, locking a byte range, and
+// moving file bytes to a socket — and each has a native answer on some platforms
+// and a documented fallback on others. Printing which one this binary got is how
+// an operator finds out that, say, locks are not being enforced against local
+// processes on this host.
+func printPlatform(w io.Writer) {
+	fmt.Fprintf(w, "platform mechanisms in use (%s):\n", samba.PlatformName())
+	for _, f := range samba.PlatformFacilities() {
+		how := "native"
+		if !f.Native {
+			how = "fallback"
+		}
+		line := fmt.Sprintf("  %-20s %-8s %s", f.Name, how, f.Detail)
+		if f.Fallbacks > 0 {
+			line += fmt.Sprintf(" (%d runtime fallback(s))", f.Fallbacks)
+		}
+		fmt.Fprintln(w, line)
+	}
+	fmt.Fprintln(w, "\nA fallback is documented, not a failure: it says what the host could not provide.")
+	fmt.Fprintln(w, "The consequences per platform are in the README support table.")
 }
 
 // printInterfaces reports the multichannel advertisement: the interfaces a

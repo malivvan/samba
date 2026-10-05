@@ -32,12 +32,42 @@ open.
   [AGENTS.md](AGENTS.md). Bringing it back would be an exported `Authenticator`
   interface, not a re-vendored acceptor — and that interface is deliberately not
   designed yet.
-- **A portable (non-Linux) build — no.** The transport and filesystem layer rely
-  on Linux facilities by design (`SO_REUSEPORT`, `inotify`, OFD locks,
-  `splice`).
+- **A portable build — done, with documented degradation.** This is no longer a
+  question of whether: the transport and filesystem layer need four facilities Go
+  does not provide (a shared listening port, directory watching, byte-range
+  locks, file→socket copies), and each now lives in `pkg/` with one
+  implementation per platform and a real fallback where the platform has nothing
+  sound. Linux, macOS, FreeBSD, OpenBSD, NetBSD, DragonFly and Windows build and
+  pass `go vet`, the `pkg/` tests run natively on Linux, macOS and Windows, and
+  the per-platform consequences — including the ones an operator has to know
+  about, such as locks not being enforced against local processes on macOS and
+  the BSDs — are in the README support table and reported at runtime by
+  `samba --list-platform`. What remains open is measured in *verification*, not
+  in features: see the testing item in P3.
 - **CGO, `unsafe`, or a C crypto backend — no.** The point of this
   implementation is a statically linkable, memory-safe server; FIPS mode comes
   from Go's own validated module instead (see [docs/FIPS.md](docs/FIPS.md)).
+  This is also why the platform integration is written against `x/sys` and the
+  standard library rather than against the C libraries that own the facilities:
+  macOS FSEvents (a framework, reachable only through cgo or `unsafe`), macOS
+  `F_RDADVISE` (takes a struct pointer that `x/sys/unix` cannot pass without
+  `unsafe`), Windows TransmitFile and RDMA verbs are all out for that reason, and
+  each has a documented fallback instead (see the README support table).
+- **One protocol implementation, four host facilities.** Only the parts that are
+  genuinely the operating system's — sharing a listening port, watching a
+  directory, locking a byte range, copying file bytes to a socket — are
+  per-platform, and they live in `pkg/`. Everything above them (framing, crypto,
+  signing, encryption, the limits, the panic guards) is one Go codebase with no
+  build tags, so a platform cannot silently get a weaker protocol. In particular
+  there is no per-platform *authorization* or per-platform dialect behaviour.
+- **`SO_REUSEADDR` on Windows — never, and `SO_EXCLUSIVEADDRUSE` instead.**
+  Windows' option of that name lets another socket forcibly bind an address that
+  is already in use and take its connections, which for a server whose point is
+  being reachable is a weakness, not portability. `pkg/reuseport` therefore never
+  sets it, asks for **`SO_EXCLUSIVEADDRUSE`** instead (Microsoft's own
+  recommendation for servers, and the reason a Windows listener cannot be
+  hijacked even by a socket asking for `SO_REUSEADDR`), and reports
+  `Available() == false` so the workers share a single listener.
 - **A different kind of server.** `passdb`, `idmap`/`winbindd`, NT4 domain
   controller functionality, print services, and the `net`/`pdbedit`/`smbpasswd`/
   SWAT administration tools would each turn this into something other than an
@@ -336,13 +366,24 @@ open.
   deployment on a high-latency or high-bandwidth link cannot retune without a
   rebuild (see [docs/TUNING.md](docs/TUNING.md) for what is fixed today).
 - **`kernel oplocks` and `strict locking` equivalents.** This server takes
-  leases in its own table and uses OFD byte-range locks, but it has no
-  kernel-oplock integration, so a local process and an SMB client can both think
-  they own a file. Without it, mixing local and network access to the same share
-  is unsafe — the reason the README tells you not to.
+  leases in its own table, and its byte-range locks are enforced against other
+  local processes only where the kernel has per-handle locks (OFD on Linux,
+  `LockFileEx` on Windows — see the README support table). What is missing on
+  every platform is the other direction: a *lease* held by an SMB client is not
+  broken when a local process opens or writes the file, and a local lock is not
+  turned into a lease break. Without it, mixing local and network access to the
+  same share is unsafe — the reason the README tells you not to.
 
 ### Packaging and testing
 
+- **Runtime verification of the BSD legs.** FreeBSD, OpenBSD and NetBSD build and
+  pass `go vet` in CI, but nothing *runs* there, so the code paths that only they
+  have — kqueue on a BSD kernel, `statvfs` on NetBSD, `fstatfs` on OpenBSD and
+  DragonFly, `sendfile` against a BSD socket — are compile-verified rather than
+  exercised. A VM runner (a QEMU-backed GitHub action, or a self-hosted runner)
+  running `go test ./pkg/...` would close the gap; it is not there today because
+  it means adding a third-party action to a security-sensitive CI. The README
+  support table states the limit rather than implying otherwise.
 - **A test/container image.** The host suites in `bench/` need root and
   cifs.ko; a container that runs a real client against the server would let the
   integration tests run in CI. Without it, the end-to-end behaviour that only a

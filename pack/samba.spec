@@ -14,7 +14,9 @@ unsafe). It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 authentication, SMB2/3
 signing, SMB 3.1.1 preauth integrity, SMB3
 multichannel, and SMB3 encryption (AES-128/256-GCM and -CCM), plus byte-range
 locks, leases, and directory change notification. Large unsigned reads move
-file pages to the socket through splice(2) without entering userspace.
+file pages to the socket through splice(2) without entering userspace, and
+every host facility it needs is native on Linux (the same source also builds
+for macOS, the BSDs and Windows).
 
 %prep
 %setup -q
