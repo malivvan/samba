@@ -46,6 +46,14 @@ require_signing = true
 # Write-caching is never granted. Default on.
 oplocks = true
 
+# Connection limit. Each connection costs goroutines plus up to one maximum-size
+# request frame of buffered data, so this is the main lever on the server's
+# worst-case memory use: memory is bounded by roughly
+# max_connections x (4.4 MiB + a few tens of KiB). The default (512) suits a
+# dedicated file server; raise it for a large deployment and lower it for a small
+# container. -1 removes the limit.
+# max_connections = 512
+
 # Authentication mechanisms: "ntlm", "kerberos" or "both" (Kerberos preferred,
 # NTLM fallback).
 # auth = "both"

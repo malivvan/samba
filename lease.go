@@ -55,8 +55,9 @@ type fileKey struct {
 // Read-caching leases held by distinct lease keys (clients) coexist; a
 // conflicting write breaks the *other* keys to none.
 type LeaseTable struct {
-	mu sync.Mutex
-	m  map[fileKey][]LeaseGrant
+	mu    sync.Mutex
+	m     map[fileKey][]LeaseGrant
+	count int
 }
 
 // NewLeaseTable returns an empty lease registry.
@@ -65,17 +66,27 @@ func NewLeaseTable() *LeaseTable { return &LeaseTable{m: make(map[fileKey][]Leas
 // Grant grants (or refreshes) a lease for g.LeaseKey on a file. There is one
 // lease per (file, lease key): a re-open with the same key replaces the prior
 // grant.
-func (t *LeaseTable) Grant(key fileKey, g LeaseGrant) {
+//
+// It reports false when the table is full — too many leases on this file, or too
+// many overall. A handle-caching lease outlives CLOSE, so without a bound a
+// client could grow the table without limit by re-opening one file with fresh
+// lease keys. The caller opens the file without a lease rather than failing.
+func (t *LeaseTable) Grant(key fileKey, g LeaseGrant) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	v := t.m[key]
 	for i := range v {
 		if v[i].LeaseKey == g.LeaseKey {
 			v[i] = g
-			return
+			return true
 		}
 	}
+	if len(v) >= maxLeasesPerFile || t.count >= maxLeasesTotal {
+		return false
+	}
 	t.m[key] = append(v, g)
+	t.count++
+	return true
 }
 
 // BreakConflicts handles a conflicting access from a holder with lease key
@@ -97,6 +108,7 @@ func (t *LeaseTable) BreakConflicts(key fileKey, writerKey *[16]byte) []BreakMsg
 			kept = append(kept, g) // the writer's own lease is not broken
 			continue
 		}
+		t.count--
 		breaks = append(breaks, BreakMsg{
 			Wid:       g.Wid,
 			ConnIdx:   g.ConnIdx,
@@ -128,7 +140,9 @@ func (t *LeaseTable) Release(key fileKey, leaseKey [16]byte) {
 	for _, g := range v {
 		if g.LeaseKey != leaseKey {
 			kept = append(kept, g)
+			continue
 		}
+		t.count--
 	}
 	if len(kept) == 0 {
 		delete(t.m, key)
@@ -147,7 +161,9 @@ func (t *LeaseTable) ReleaseConn(wid, idx int, gen uint16) {
 		for _, g := range v {
 			if !(g.Wid == wid && g.ConnIdx == idx && g.ConnGen == gen) {
 				kept = append(kept, g)
+				continue
 			}
+			t.count--
 		}
 		if len(kept) == 0 {
 			delete(t.m, k)

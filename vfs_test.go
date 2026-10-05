@@ -1,6 +1,8 @@
 package samba
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -241,5 +243,212 @@ func TestDirSnapshotWildcards(t *testing.T) {
 	}
 	if got := names("nope*"); len(got) != 0 {
 		t.Fatalf("no match = %v", got)
+	}
+}
+
+func TestHandleTableCloseAll(t *testing.T) {
+	dir := t.TempDir()
+	var tbl HandleTable
+	var files []*os.File
+	for i := range 3 {
+		f, err := os.CreateTemp(dir, "h")
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
+		tbl.Insert(&OpenFile{File: f})
+		if i == 1 {
+			// Leave a permanently holey slot to exercise that branch.
+			id := tbl.Insert(&OpenFile{File: f})
+			tbl.Remove(id)
+		}
+	}
+	if tbl.Len() != 3 {
+		t.Fatalf("Len = %d, want 3", tbl.Len())
+	}
+	tbl.CloseAll()
+	if tbl.Len() != 0 {
+		t.Fatalf("Len = %d after CloseAll", tbl.Len())
+	}
+	for i, f := range files {
+		if _, err := f.ReadAt(make([]byte, 1), 0); !errors.Is(err, fs.ErrClosed) {
+			t.Fatalf("handle %d was not closed: %v", i, err)
+		}
+	}
+	// CloseAll is idempotent.
+	tbl.CloseAll()
+}
+
+func TestVfsFileOperations(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+
+	// Opening a missing file fails with an errno.
+	if _, err := openRaw(path, os.O_RDONLY, 0); err == nil {
+		t.Fatal("opening a missing file must fail")
+	}
+	if _, err := statMeta(filepath.Join(dir, "missing")); err == nil {
+		t.Fatal("statMeta on a missing path must fail")
+	}
+
+	f, err := openRaw(path, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// pwriteAll writes everything, even past a short-write boundary.
+	data := make([]byte, 8192)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if err := pwriteAll(f, data, 0); err != nil {
+		t.Fatalf("pwriteAll: %v", err)
+	}
+	// pread reads it back.
+	got := make([]byte, len(data))
+	n, err := pread(f, got, 0)
+	if err != nil || n != len(data) {
+		t.Fatalf("pread returned %d, %v", n, err)
+	}
+	if string(got) != string(data) {
+		t.Fatal("pread returned different bytes")
+	}
+	// A read past EOF is a short read, not an error.
+	if n, err := pread(f, make([]byte, 16), int64(len(data))+100); err != nil || n != 0 {
+		t.Fatalf("pread past EOF = %d, %v", n, err)
+	}
+	// fstatMeta reports the size, and fsSizes reports a filesystem.
+	m, err := fstatMeta(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Size != uint64(len(data)) || m.IsDir {
+		t.Fatalf("meta = %+v", m)
+	}
+	total, avail, free, spu, bps, err := fsSizes(f)
+	if err != nil {
+		t.Fatalf("fsSizes: %v", err)
+	}
+	if total == 0 || spu == 0 || bps != 512 || avail > total || free < avail {
+		t.Fatalf("fsSizes = %d/%d/%d/%d/%d", total, avail, free, spu, bps)
+	}
+	// fsync and adviseSequential are best-effort.
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	adviseSequential(f)
+	// ftruncate shortens it.
+	if err := f.Truncate(16); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	if m, err := fstatMeta(f); err != nil || m.Size != 16 {
+		t.Fatalf("size after truncate = %d (%v)", m.Size, err)
+	}
+	// A write on a read-only description fails.
+	ro, err := openRaw(path, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if err := pwriteAll(ro, []byte("x"), 0); err == nil {
+		t.Fatal("writing through a read-only descriptor must fail")
+	}
+}
+
+func TestVfsRangeLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "locked")
+	if err := os.WriteFile(path, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Exclusive (write) locks need writable descriptors, as POSIX requires.
+	a, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	// A read-only descriptor can take a shared lock but not an exclusive one.
+	ro, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	if err := rangeLock(ro, 2000, 10, LockShared); err != nil {
+		t.Fatalf("shared lock on a read-only descriptor: %v", err)
+	}
+	if err := rangeLock(ro, 2000, 10, LockExclusive); err == nil {
+		t.Fatal("an exclusive lock on a read-only descriptor must fail")
+	}
+	if err := rangeLock(ro, 2000, 10, LockUnlock); err != nil {
+		t.Fatalf("unlock on a read-only descriptor: %v", err)
+	}
+
+	if err := rangeLock(a, 0, 100, LockShared); err != nil {
+		t.Fatalf("shared lock: %v", err)
+	}
+	if err := rangeLock(b, 0, 100, LockShared); err != nil {
+		t.Fatalf("second shared lock: %v", err)
+	}
+	if err := rangeLock(a, 0, 100, LockExclusive); err == nil {
+		t.Fatal("a conflicting exclusive lock must fail")
+	}
+	if err := rangeLock(a, 0, 100, LockUnlock); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	if err := rangeLock(b, 0, 100, LockUnlock); err != nil {
+		t.Fatalf("second unlock: %v", err)
+	}
+	if err := rangeLock(a, 0, 100, LockExclusive); err != nil {
+		t.Fatalf("exclusive lock after unlock: %v", err)
+	}
+	// A zero length means "to the end of the file".
+	if err := rangeLock(a, 0, 0, LockUnlock); err != nil {
+		t.Fatalf("whole-file unlock: %v", err)
+	}
+	// Locking an absurd range is clamped rather than overflowing.
+	if err := rangeLock(a, ^uint64(0), ^uint64(0), LockUnlock); err != nil {
+		t.Fatalf("clamped range: %v", err)
+	}
+}
+
+func TestVfsDirSnapshotErrors(t *testing.T) {
+	dir := t.TempDir()
+	f, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	// A handle whose path is gone cannot be snapshotted.
+	of := &OpenFile{File: f, Path: filepath.Join(dir, "vanished"), IsDir: true}
+	if _, err := dirSnapshot(of, "*"); err == nil {
+		t.Fatal("snapshotting a missing directory must fail")
+	}
+	// A handle whose descriptor is closed cannot be stat'ed either.
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dirSnapshot(of, "*"); err == nil {
+		t.Fatal("snapshotting a closed handle must fail")
+	}
+}
+
+func TestFiletimeBounds(t *testing.T) {
+	// Times before the Windows epoch clamp to zero.
+	if got := filetime(-epochDeltaSecs-1, 0); got != 0 {
+		t.Fatalf("filetime before the epoch = %d", got)
+	}
+	// Sub-second precision is preserved at 100ns resolution.
+	if got := filetime(0, 123_456_789); got != 116_444_736_000_000_000+1_234_567 {
+		t.Fatalf("filetime(0, 123456789) = %d", got)
+	}
+	if got := filetime(-epochDeltaSecs, 0); got != 0 {
+		t.Fatalf("filetime at the epoch = %d", got)
 	}
 }

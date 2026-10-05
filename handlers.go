@@ -1,8 +1,10 @@
 package samba
 
 import (
+	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -648,7 +650,20 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 			}
 			sid = h.SessionID
 		} else {
-			sid, _ = srv.sessions.Create()
+			// A client can ask for sessions far faster than for anything else,
+			// and each one costs a handle table and a tree map, so both the
+			// per-connection and the server-wide count are bounded.
+			if len(pc.Channels) >= maxSessionsPerConn {
+				LogWarn("refusing a session: %d already set up on this connection", len(pc.Channels))
+				errResp(tx, h, StatusInsufficientResources, chain)
+				return
+			}
+			var created bool
+			if sid, _, created = srv.sessions.Create(); !created {
+				LogWarn("refusing a session: the server is at its session limit (%d)", maxSessionsTotal)
+				errResp(tx, h, StatusInsufficientResources, chain)
+				return
+			}
 		}
 		chain.SessionID = sid
 		ch := &ChannelState{
@@ -873,7 +888,17 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 			LogWarn("anonymous session denied: encryption is required but guest sessions cannot be encrypted")
 			errResp(tx, h, StatusAccessDenied, chain)
 		case srv.allowGuest:
-			sid, sref := srv.sessions.Create()
+			if len(pc.Channels) >= maxSessionsPerConn {
+				LogWarn("refusing a session: %d already set up on this connection", len(pc.Channels))
+				errResp(tx, h, StatusInsufficientResources, chain)
+				return
+			}
+			sid, sref, created := srv.sessions.Create()
+			if !created {
+				LogWarn("refusing a session: the server is at its session limit (%d)", maxSessionsTotal)
+				errResp(tx, h, StatusInsufficientResources, chain)
+				return
+			}
 			sref.Lock()
 			sref.Established = true
 			sref.Guest = true
@@ -975,6 +1000,11 @@ func treeConnect(srv *Srv, sess *Session, h *ReqHdr, msg []byte, chain *Chain, t
 			errResp(tx, h, StatusBadNetworkName, chain)
 			return
 		}
+	}
+	if len(sess.Trees) >= maxTreesPerSession {
+		LogWarn("refusing a tree connect: %d already connected on this session", len(sess.Trees))
+		errResp(tx, h, StatusInsufficientResources, chain)
+		return
 	}
 	sess.NextTreeID++
 	treeID := sess.NextTreeID
@@ -1168,6 +1198,14 @@ func create(
 		return
 	}
 
+	// The handle table protects the process descriptor table, which one client
+	// could otherwise exhaust (breaking every other client's i/o).
+	if sess.Handles.Len() >= maxHandlesPerSession {
+		LogWarn("refusing an open: %d handles already open on this session", sess.Handles.Len())
+		errResp(tx, h, StatusInsufficientResources, chain)
+		return
+	}
+
 	existingMeta, existingErr := statMeta(path)
 	exists := existingErr == nil
 	existingDir := exists && existingMeta.IsDir
@@ -1303,7 +1341,7 @@ func create(
 	fid := sess.Handles.Insert(of)
 	chain.LastFID = &fid
 	if grantLease {
-		srv.leases.Grant(fileKey{ShareIdx: shareIdx, Ino: meta.Ino}, LeaseGrant{
+		granted := srv.leases.Grant(fileKey{ShareIdx: shareIdx, Ino: meta.Ino}, LeaseGrant{
 			LeaseKey:  lr.Key,
 			State:     grantedState,
 			Epoch:     lr.Epoch,
@@ -1312,7 +1350,18 @@ func create(
 			ConnIdx:   cid.Idx,
 			ConnGen:   cid.Gen,
 		})
-		LogDebug("lease: granted %#x (share %d, ino %d)", grantedState, shareIdx, meta.Ino)
+		if !granted {
+			// The lease table is full. The open still succeeds — the client just
+			// does not get to cache, and re-reads. The lease key stays recorded so
+			// a write on this handle still exempts the client's own key.
+			LogDebug("lease: not granted, table full (share %d, ino %d)", shareIdx, meta.Ino)
+			grantLease = false
+			grantedState = 0
+			of.HasLease = false
+			of.LeaseGranted = 0
+		} else {
+			LogDebug("lease: granted %#x (share %d, ino %d)", grantedState, shareIdx, meta.Ino)
+		}
 	}
 
 	beginResp(tx, h, StatusSuccess, chain.Related, chain.TreeID, chain.SessionID)
@@ -1534,8 +1583,15 @@ func read(pc *ProtoConn, sess *Session, h *ReqHdr, body []byte, chain *Chain, tx
 		errResp(tx, h, StatusInvalidDeviceRequest, chain)
 		return nil
 	}
-	f := of.File
+	// Take a reference to the handle so that a CLOSE on another channel (which
+	// takes the session lock, and therefore cannot race this) does not close the
+	// descriptor while the read is in flight.
+	f := of.use()
 	sess.Unlock()
+	if f == nil {
+		errResp(tx, h, StatusFileClosed, chain)
+		return nil
+	}
 
 	length = min(length, maxRead)
 
@@ -1551,6 +1607,7 @@ func read(pc *ProtoConn, sess *Session, h *ReqHdr, body []byte, chain *Chain, tx
 		}
 		return &ZcReadPlan{
 			File:         f,
+			Owner:        of,
 			Offset:       offset,
 			Length:       length,
 			MinCount:     minCount,
@@ -1564,6 +1621,7 @@ func read(pc *ProtoConn, sess *Session, h *ReqHdr, body []byte, chain *Chain, tx
 	}
 
 	// Buffered path (small reads, compounds, signed, encrypted).
+	defer of.release()
 	buf := make([]byte, length)
 	n, err := pread(f, buf, int64(offset))
 	switch {
@@ -1719,6 +1777,13 @@ func queryDirectory(sess *Session, h *ReqHdr, msg []byte, chain *Chain, tx *Writ
 			return
 		}
 		pattern = FromUTF16LE(raw)
+	}
+
+	if utf8.RuneCountInString(pattern) > maxSearchPatternRunes {
+		// Windows caps SMB search patterns at 255 characters; rejecting a longer
+		// one also bounds the work the wildcard matcher can be asked to do.
+		errResp(tx, h, StatusObjectNameInvalid, chain)
+		return
 	}
 
 	of, ok := sess.Handles.Get(fid)
@@ -2242,12 +2307,19 @@ func setDisposition(of *OpenFile, data []byte) uint32 {
 	}
 	flag := data[0]
 	if flag != 0 && of.IsDir {
-		// Windows semantics: refuse to mark a non-empty directory.
-		ents, err := os.ReadDir(of.Path)
+		// Windows semantics: refuse to mark a non-empty directory. Asking for one
+		// name avoids materialising a whole large directory in memory just to
+		// answer "is it empty".
+		d, err := os.Open(of.Path)
 		if err != nil {
 			return statusFromErr(err)
 		}
-		if len(ents) > 0 {
+		names, err := d.Readdirnames(1)
+		d.Close()
+		if err != nil && err != io.EOF {
+			return statusFromErr(err)
+		}
+		if len(names) > 0 {
 			return StatusDirectoryNotEmpty
 		}
 	}
@@ -2447,6 +2519,14 @@ func changeNotify(pc *ProtoConn, sess *Session, h *ReqHdr, body []byte, chain *C
 	}
 	if !of.IsDir {
 		errResp(tx, h, StatusInvalidParameter, chain)
+		return
+	}
+	// Each pending notification costs an inotify watch, and the kernel's watch
+	// budget is shared with every other process on the host, so the pending count
+	// per connection is bounded.
+	if len(pc.NotifyActive) >= maxNotifyWatchesPerConn {
+		LogWarn("refusing CHANGE_NOTIFY: %d already pending on this connection", len(pc.NotifyActive))
+		errResp(tx, h, StatusInsufficientResources, chain)
 		return
 	}
 	path := of.Path

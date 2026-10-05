@@ -71,10 +71,28 @@ and written by the driver, before the next batch. This preserves the invariant
 that a socket has exactly one writer, and it means a break is delivered as soon
 as the transmit side is free — not while a response batch is mid-flight.
 
+**bounds and timeouts** — nothing a peer can drive is unbounded, and no wait is
+eternal. The reader *reserves* a frame's memory from a per-connection byte budget
+before allocating it, so a peer that stops reading its responses cannot make the
+server buffer more than one maximum-size frame; a connection slot is reserved
+before the connection is served, so a connection flood is refused rather than
+served badly. A frame that is announced but not finished within
+`frameBodyTimeout` is reaped, a response write that makes no progress for
+`stallTimeout` aborts, and the zero-copy pump gives up on a peer that stops
+moving data. An *idle* connection is deliberately never disconnected, because a
+mounted share sitting unused is normal. The quantities are in `limits.go`, each
+with the attack it prevents, and the reasoning is in [REVIEW.md](../REVIEW.md).
+
+**panic isolation** — every long-lived goroutine runs under a guard: a panic is
+logged with its stack trace and tears down that connection (or that worker
+iteration) only. A file server must not have a single point of failure reachable
+from a frame.
+
 **teardown** — when the reader ends (peer closed, framing error, read error) the
 driver flushes nothing more, releases every lease held by the connection's
 slot, drops its session channels (tearing a session down when its last channel
-goes, closing that session's remaining handles), and recycles the slot.
+goes, closing that session's remaining handles), hands back its memory
+reservation and connection slot, and recycles the slot.
 
 ## Zero-copy READ path
 
@@ -89,6 +107,11 @@ to be signed or encrypted never puts the file's bytes in userspace:
 
 Two details are load-bearing:
 
+- **A plan holds a reference to its handle.** Reads run without the session
+  lock so channels can read in parallel, which means a CLOSE on another channel
+  must not close the descriptor mid-transfer: the plan carries a reference
+  (`ZcReadPlan.Owner`) that the transport releases on every path, whether the
+  plan is served or abandoned.
 - **The file is read at an explicit offset.** `sendfile(2)` and the splice
   variant that Go's `io.Copy` reaches for use, and advance, a file descriptor's
   own position. That is unusable here: SMB reads are addressed by offset, and

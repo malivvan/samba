@@ -316,6 +316,19 @@ type ZcReadPlan struct {
 	// possible), so the transport can emit header+payload without a
 	// userspace round trip to learn the byte count.
 	Linked bool
+	// Owner is the handle being read. The plan holds a reference to it (taken
+	// under the session lock) so that a CLOSE on another channel cannot close
+	// the descriptor while the payload is being transferred. The transport must
+	// call release exactly once, whether the plan is served or abandoned.
+	Owner *OpenFile
+}
+
+// release gives back the handle reference the plan holds.
+func (p *ZcReadPlan) release() {
+	if p.Owner != nil {
+		p.Owner.release()
+		p.Owner = nil
+	}
 }
 
 // frameAction tells the transport what to do with a processed frame.

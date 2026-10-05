@@ -52,6 +52,13 @@ external security review has been done yet. Know the following before deploying.
   Symlinks that already exist inside a share are **followed, even if they point
   outside it** (like Samba's `wide links`). Clients cannot create symlinks over
   SMB, so only someone with local access to the share tree can plant one.
+- **Resource limits** — every client-controllable resource is bounded
+  (connections, sessions, handles, inotify watches, leases, buffered request
+  bytes) and every stall is timed out, so a single peer cannot exhaust a shared
+  resource or hold one forever. A peer that trips a bug cannot take the process
+  down either: each connection and worker runs under a panic guard that logs the
+  stack and drops only that connection. The limits, the timeouts and the
+  reasoning behind each are in [REVIEW.md](REVIEW.md).
 - **Deployment** — a hardened build (Kerberos or NTLMv2 + `require_signing`,
   optionally `encrypt`) is reasonable beyond a trusted LAN, but a full security
   review has not been done; do not expose port 445 to the public internet until

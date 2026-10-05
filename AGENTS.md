@@ -100,7 +100,14 @@ Not implemented, and each has a reason recorded in `docs/` or `SECURITY.md`:
   also gets a few seconds of fuzzing before it lands.
 - **Never trust client-supplied offsets/lengths.** Every decode path uses the
   bounds-checked `Reader`; slice arithmetic on wire data goes through
-  `sliceAt`. A panic on malformed input is a security bug.
+  `sliceAt`. A panic on malformed input is a security bug — and if one is ever
+  reachable, the per-connection panic guard contains it rather than taking the
+  process down.
+- **Every client-controllable resource has a bound.** Add new ones to
+  `limits.go` with a comment explaining what a peer could otherwise do, and
+  answer `STATUS_INSUFFICIENT_RESOURCES` when it is hit. Equally, every wait has
+  a timeout, and an *idle* connection is never disconnected. [REVIEW.md](REVIEW.md)
+  is the record of the review that established this.
 - **Offset discipline in the read path.** SMB reads are addressed by offset and
   a handle can be read concurrently from several channels of one session, so
   file access uses positional I/O (`ReadAt`/`WriteAt`, explicit-offset

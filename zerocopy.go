@@ -3,8 +3,9 @@ package samba
 import (
 	"errors"
 	"io"
-	"net"
 	"os"
+	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -38,9 +39,18 @@ const zcPipeTarget = int(MaxReadTarget)
 // the connection as unusable.
 var errZeroCopyShort = errors.New("samba: zero-copy read ended early")
 
+// spliceTarget is the subset of a connection the zero-copy path needs: its raw
+// descriptor, so the kernel can move pages without userspace copies. Both
+// *net.TCPConn and *net.UnixConn satisfy it.
+type spliceTarget interface {
+	SyscallConn() (syscall.RawConn, error)
+}
+
 // spliceFileToConn streams n bytes of f starting at off into tc. It reports an
-// error if fewer than n bytes could be transferred.
-func spliceFileToConn(tc *net.TCPConn, f *os.File, off int64, n int) error {
+// error if fewer than n bytes could be transferred, or if the peer makes no
+// progress at all for stall (a stalled peer must not pin a goroutine, its
+// buffers and its connection slot forever).
+func spliceFileToConn(tc spliceTarget, f *os.File, off int64, n int, stall time.Duration) error {
 	if n <= 0 {
 		return nil
 	}
@@ -64,7 +74,7 @@ func spliceFileToConn(tc *net.TCPConn, f *os.File, off int64, n int) error {
 	srcFD := int(f.Fd())
 	var inner error
 	if cerr := raw.Control(func(sockFD uintptr) {
-		inner = splicePump(int(sockFD), srcFD, pipeR, pipeW, off, n)
+		inner = splicePump(int(sockFD), srcFD, pipeR, pipeW, off, n, stall)
 	}); cerr != nil {
 		return cerr
 	}
@@ -72,12 +82,18 @@ func spliceFileToConn(tc *net.TCPConn, f *os.File, off int64, n int) error {
 }
 
 // splicePump moves n bytes from srcFD at off through the pipe into sockFD,
-// keeping both the source offset explicit and the socket non-blocking.
-func splicePump(sockFD, srcFD, pipeR, pipeW int, off int64, n int) error {
+// keeping both the source offset explicit and the socket non-blocking. deadline
+// is extended by every byte that moves, so only a peer that stops making
+// progress is given up on.
+func splicePump(sockFD, srcFD, pipeR, pipeW int, off int64, n int, stall time.Duration) error {
+	deadline := time.Now().Add(stall)
 	capacity := pipeCapacity(pipeR)
 	written := 0 // bytes moved out of the file
 	queued := 0  // bytes currently sitting in the pipe
 	for written < n || queued > 0 {
+		if time.Now().After(deadline) {
+			return errors.New("samba: peer stalled during a zero-copy read")
+		}
 		// Top the pipe up while there is room and data left.
 		if written < n && queued < capacity {
 			want := min(n-written, capacity-queued)
@@ -108,6 +124,7 @@ func splicePump(sockFD, srcFD, pipeR, pipeW int, off int64, n int) error {
 		switch {
 		case err == nil && k > 0:
 			queued -= int(k)
+			deadline = time.Now().Add(stall)
 		case err == nil:
 			return errZeroCopyShort
 		case errors.Is(err, unix.EINTR):

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/BurntSushi/toml"
 )
@@ -46,6 +47,10 @@ type Config struct {
 	PreferAES256 bool `toml:"prefer_aes256"`
 	// Oplocks grants read-caching (and, when asked, handle-caching) leases.
 	Oplocks bool `toml:"oplocks"`
+	// MaxConnections caps how many connections the server serves at once. It is
+	// the main lever on worst-case memory use (see the tuning notes); a negative
+	// value removes the limit.
+	MaxConnections *int `toml:"max_connections"`
 	// Auth selects the authentication mechanisms to advertise and accept.
 	Auth AuthMode `toml:"auth"`
 	// Kerberos holds the Kerberos acceptor settings.
@@ -113,12 +118,14 @@ const DefaultServerName = "SAMBA"
 
 // newConfig returns a Config with every default filled in.
 func newConfig() Config {
+	maxConns := DefaultMaxConnections
 	return Config{
-		Listen:     DefaultListen,
-		ServerName: DefaultServerName,
-		LogLevel:   LevelInfo,
-		Oplocks:    true,
-		Auth:       AuthBoth,
+		Listen:         DefaultListen,
+		ServerName:     DefaultServerName,
+		LogLevel:       LevelInfo,
+		Oplocks:        true,
+		MaxConnections: &maxConns,
+		Auth:           AuthBoth,
 	}
 }
 
@@ -198,6 +205,9 @@ func (c *Config) validate() error {
 }
 
 func isHex(s string) bool {
+	if s == "" {
+		return false
+	}
 	for i := range len(s) {
 		c := s[i]
 		switch {
@@ -264,6 +274,12 @@ type Srv struct {
 	sessions   *Registry
 	mailboxes  []*Mailbox
 	leases     *LeaseTable
+	// conns bounds the connections the server serves at once.
+	conns *connLimiter
+	// krb holds the Kerberos acceptor, built once on first use.
+	krbOnce sync.Once
+	krbAcc  *KerberosAcceptor
+	krbErr  error
 }
 
 // Config exposes the parsed configuration.
@@ -284,6 +300,37 @@ func (s *Srv) Sessions() *Registry { return s.sessions }
 
 // Leases is the file-keyed lease registry, shared across all workers.
 func (s *Srv) Leases() *LeaseTable { return s.leases }
+
+// kerberosAcceptor returns the shared Kerberos acceptor, building it once. The
+// keytab and settings are read-only after construction, so one acceptor serves
+// every connection (and, unlike a per-connection credential, the keytab is read
+// from disk once instead of once per logon — which also removes an I/O
+// amplification a client could otherwise drive).
+func (s *Srv) kerberosAcceptor() (*KerberosAcceptor, error) {
+	s.krbOnce.Do(func() {
+		spn := ""
+		keytabPath := ""
+		if kcfg := s.cfg.Kerberos; kcfg != nil {
+			spn = kcfg.SPN
+			keytabPath = kcfg.Keytab
+		}
+		if spn == "" {
+			spn = "cifs/" + s.cfg.ServerName
+		}
+		s.krbAcc, s.krbErr = NewKerberosAcceptor(spn, keytabPath)
+	})
+	return s.krbAcc, s.krbErr
+}
+
+// checkKerberos reports whether the Kerberos acceptor can be built, so a
+// misconfigured keytab is visible at startup rather than at the first logon.
+func (s *Srv) checkKerberos() error {
+	if !s.cfg.Auth.AllowsKerberos() {
+		return nil
+	}
+	_, err := s.kerberosAcceptor()
+	return err
+}
 
 // randBytes fills buf with cryptographically secure random bytes.
 func randBytes(buf []byte) {

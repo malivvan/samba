@@ -3,9 +3,11 @@ package samba
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -35,6 +37,20 @@ const (
 	// maxBatchFrames bounds how many coalesced frames are processed per wakeup.
 	maxBatchFrames = 64
 )
+
+// frameBodyTimeout bounds how long a peer may take to finish a frame it has
+// started. It is generous enough for a slow link sending a multi-megabyte write,
+// and it stops a peer from holding a connection (and its buffers) forever with a
+// truncated frame. An idle connection is unaffected: the timeout is only armed
+// once a frame's length is known.
+//
+// It is a variable rather than a constant only so tests can shorten it.
+var frameBodyTimeout = 5 * time.Minute
+
+// stallTimeout bounds how long a peer may stall a response with no progress at
+// all (a zero receive window, or a peer that stopped reading). It is reset by
+// any progress, so a slow-but-moving client is never disconnected.
+var stallTimeout = 5 * time.Minute
 
 // pendingFrame is a server-initiated frame queued for a connection's own
 // goroutine. Only that goroutine writes to the socket, so lease breaks and
@@ -132,12 +148,27 @@ func NewServer(cfg *Config) (*Server, error) {
 		mailboxes:  mbs,
 		leases:     NewLeaseTable(),
 	}
+	maxConns := DefaultMaxConnections
+	if cfg.MaxConnections != nil {
+		maxConns = *cfg.MaxConnections
+	}
+	srv.conns = newConnLimiter(maxConns)
+	// Surface an unusable keytab at startup rather than at the first logon.
+	if err := srv.checkKerberos(); err != nil {
+		if cfg.Auth == AuthKerberos {
+			return nil, fmt.Errorf("auth = \"kerberos\" but the acceptor cannot be built: %w", err)
+		}
+		if cfg.Kerberos != nil {
+			LogWarn("kerberos: %v (Kerberos logons will fail; the configured fallback still works)", err)
+		}
+	}
 	s := &Server{srv: srv, stop: make(chan struct{})}
 	for i := range nworkers {
 		s.workers = append(s.workers, &worker{
 			id:    i,
 			srv:   srv,
 			addr:  listenAddr,
+			wg:    &s.wg,
 			conns: make(map[int]*conn),
 			gens:  make(map[int]uint16),
 			stop:  s.stop,
@@ -150,14 +181,22 @@ func NewServer(cfg *Config) (*Server, error) {
 func (s *Server) Srv() *Srv { return s.srv }
 
 // Start binds every worker's listener and starts its accept loop.
+//
+// It reports an error if the server has already been stopped: starting workers
+// that nothing will ever shut down would leave Wait blocked forever.
 func (s *Server) Start() error {
+	select {
+	case <-s.stop:
+		return errors.New("samba: the server has already been stopped")
+	default:
+	}
 	for _, w := range s.workers {
 		ln, err := listenReusePort(w.addr)
 		if err != nil {
 			s.Stop()
 			return err
 		}
-		w.ln = ln
+		w.setListener(ln)
 		s.wg.Add(1)
 		go func(w *worker) {
 			defer s.wg.Done()
@@ -175,10 +214,14 @@ func (s *Server) Start() error {
 // Addr returns the bound address of the first worker (tests bind :0 and read
 // it back).
 func (s *Server) Addr() net.Addr {
-	if len(s.workers) == 0 || s.workers[0].ln == nil {
+	if len(s.workers) == 0 {
 		return nil
 	}
-	return s.workers[0].ln.Addr()
+	ln := s.workers[0].listener()
+	if ln == nil {
+		return nil
+	}
+	return ln.Addr()
 }
 
 // Serve starts the server and blocks until Stop is called.
@@ -195,15 +238,15 @@ func (s *Server) Stop() {
 	s.once.Do(func() {
 		close(s.stop)
 		for _, w := range s.workers {
-			if w.ln != nil {
-				w.ln.Close()
+			if ln := w.listener(); ln != nil {
+				ln.Close()
 			}
 			w.closeAll()
 		}
 	})
 }
 
-// Wait blocks until all workers have exited.
+// Wait blocks until every worker and every connection goroutine has finished.
 func (s *Server) Wait() { s.wg.Wait() }
 
 // listenReusePort binds a TCP listener with SO_REUSEADDR + SO_REUSEPORT so every
@@ -237,6 +280,9 @@ type worker struct {
 	srv  *Srv
 	addr string
 	ln   net.Listener
+	// wg is the server's WaitGroup, so Wait covers connection goroutines too and
+	// not just the accept loops.
+	wg *sync.WaitGroup
 
 	mu    sync.Mutex
 	conns map[int]*conn
@@ -247,33 +293,93 @@ type worker struct {
 	stop chan struct{}
 }
 
+// setListener publishes this worker's bound listener.
+func (w *worker) setListener(ln net.Listener) {
+	w.mu.Lock()
+	w.ln = ln
+	w.mu.Unlock()
+}
+
+// listener returns this worker's listener, or nil before it is bound. The field
+// is written by Start and read by Addr and Stop, so it needs the lock.
+func (w *worker) listener() net.Listener {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ln
+}
+
 func (w *worker) acceptLoop() {
-	for {
-		nc, err := w.ln.Accept()
-		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			select {
-			case <-w.stop:
-				return
-			default:
-			}
-			// Transient failure (e.g. EMFILE): back off briefly and retry
-			// rather than losing the worker.
-			LogWarn("worker %d: accept failed: %v", w.id, err)
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		if tc, ok := nc.(*net.TCPConn); ok {
-			// SMB request/response benefits from disabling Nagle.
-			_ = tc.SetNoDelay(true)
-		}
-		tcp, _ := nc.(*net.TCPConn)
-		c := w.newConn(nc, tcp)
-		LogDebug("worker %d: new connection (slot %d)", w.id, c.idx)
-		go c.serve()
+	for w.acceptOnce() {
 	}
+}
+
+// acceptOnce accepts and starts one connection, reporting whether the worker
+// should keep serving. It is a separate function so that a panic while handling
+// one connection cannot end the worker: the panic is logged and the loop
+// continues.
+func (w *worker) acceptOnce() (keepGoing bool) {
+	keepGoing = true
+	defer func() {
+		if r := recover(); r != nil {
+			LogWarn("worker %d: panic while accepting: %v\n%s", w.id, r, debug.Stack())
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+	ln := w.listener()
+	if ln == nil {
+		return false
+	}
+	nc, err := ln.Accept()
+	if err != nil {
+		if errors.Is(err, net.ErrClosed) {
+			return false
+		}
+		select {
+		case <-w.stop:
+			return false
+		default:
+		}
+		// Transient failure (e.g. EMFILE): back off briefly and retry rather
+		// than losing the worker.
+		LogWarn("worker %d: accept failed: %v", w.id, err)
+		time.Sleep(50 * time.Millisecond)
+		return true
+	}
+	// Refuse rather than accept a connection the server cannot afford to serve:
+	// each one costs goroutines and buffered request bytes.
+	if !w.srv.conns.Acquire() {
+		LogWarn("worker %d: refusing connection: %d already served (max_connections)",
+			w.id, w.srv.conns.Count())
+		nc.Close()
+		return true
+	}
+	started := false
+	defer func() {
+		if !started {
+			// The connection never reached its own teardown (an error path or a
+			// panic here), so give the slot back on its behalf.
+			w.srv.conns.Release()
+			nc.Close()
+		}
+	}()
+	if tc, ok := nc.(*net.TCPConn); ok {
+		// SMB request/response benefits from disabling Nagle.
+		_ = tc.SetNoDelay(true)
+	}
+	tcp, _ := nc.(*net.TCPConn)
+	c := w.newConn(nc, tcp)
+	LogDebug("worker %d: new connection (slot %d)", w.id, c.idx)
+	started = true
+	if w.wg != nil {
+		w.wg.Add(1)
+	}
+	go func() {
+		if w.wg != nil {
+			defer w.wg.Done()
+		}
+		c.serve()
+	}()
+	return true
 }
 
 // mailboxLoop delivers lease/oplock breaks posted by other workers.
@@ -290,11 +396,22 @@ func (w *worker) mailboxLoop() {
 					break
 				}
 				for _, b := range msgs {
-					w.deliverBreak(b)
+					w.deliverBreakGuarded(b)
 				}
 			}
 		}
 	}
+}
+
+// deliverBreakGuarded delivers one break, containing a panic to this worker
+// rather than letting it end the process.
+func (w *worker) deliverBreakGuarded(b BreakMsg) {
+	defer func() {
+		if r := recover(); r != nil {
+			LogWarn("worker %d: panic delivering a lease break: %v\n%s", w.id, r, debug.Stack())
+		}
+	}()
+	w.deliverBreak(b)
 }
 
 // deliverBreak routes a break to the connection that holds the lease, dropping
@@ -332,6 +449,7 @@ func (w *worker) newConn(nc net.Conn, tcp *net.TCPConn) *conn {
 		gen:      gen,
 		pc:       NewProtoConn(w.srv, w.id, idx, gen),
 		frames:   make(chan []byte, 64),
+		rxBudget: newBudget(maxQueuedRxBytes),
 		deferred: newDeferredQueue(),
 		done:     make(chan struct{}),
 	}
@@ -381,6 +499,11 @@ type conn struct {
 	pc  *ProtoConn
 	// frames carries complete NetBIOS-framed messages from the reader.
 	frames chan []byte
+	// rxBudget bounds the request bytes this connection holds while they wait to
+	// be processed, and rxHeld is how many the reader has reserved; teardown
+	// hands them back.
+	rxBudget *budget
+	rxHeld   atomic.Int64
 	// deferred holds server-initiated frames, drained by this connection's
 	// goroutine (the only writer to the socket).
 	deferred *deferredQueue
@@ -400,36 +523,78 @@ func (c *conn) deferFrame(pf pendingFrame) { c.deferred.push(pf) }
 // disconnect.
 func (c *conn) serve() {
 	defer c.teardown()
-	go c.notifier.run()
-	go c.readLoop()
+	c.guard("connection", c.serveLoop)
+}
+
+// guard runs fn, converting a panic into a logged teardown of this one
+// connection. A file server must not have a reachable single point of failure:
+// without this, one malformed frame that trips a bug would take the whole
+// process (and every other client) down with it.
+//
+// The handler itself is written defensively — it must not be possible for the
+// recovery path to panic in turn, or the containment would be worthless.
+func (c *conn) guard(where string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			worker := -1
+			if c.w != nil {
+				worker = c.w.id
+			}
+			LogWarn("worker %d slot %d: panic in %s: %v\n%s", worker, c.idx, where, r, debug.Stack())
+			if c.done != nil {
+				c.shutdown()
+			}
+		}
+	}()
+	fn()
+}
+
+// serveLoop is the connection's driver: it reads frames, processes them in
+// batches, writes the batched responses, and interleaves server-initiated
+// frames. It returns when the peer goes away, the peer closes, or a
+// protocol-level failure requires a disconnect.
+func (c *conn) serveLoop() {
+	go c.guard("notifier", c.notifier.run)
+	go c.guard("reader", c.readLoop)
 
 	tx := NewWriter(4096)
 	var (
 		zc      *ZcReadPlan
 		backlog [][]byte
 	)
+	// A plan that is produced but never served (because the connection is torn
+	// down first) still holds a reference to its handle: give it back.
+	defer func() {
+		if zc != nil {
+			zc.release()
+		}
+	}()
 	for {
 		// Flush buffered responses, then any queued server-initiated frames.
 		if tx.Len() > 0 {
 			if !c.write(tx.Bytes()) {
+				LogDebug("slot %d: driver ending: response write failed", c.idx)
 				return
 			}
 			tx.Truncate(0)
 		}
 		if zc != nil {
 			if !c.sendRead(zc) {
+				LogDebug("slot %d: driver ending: zero-copy read failed", c.idx)
 				return
 			}
 			zc = nil
 			continue
 		}
 		if !c.flushDeferred() {
+			LogDebug("slot %d: driver ending: deferred frame write failed", c.idx)
 			return
 		}
 		if len(backlog) == 0 {
 			select {
 			case f, ok := <-c.frames:
 				if !ok {
+					LogDebug("slot %d: driver ending: reader finished", c.idx)
 					return
 				}
 				backlog = append(backlog, f)
@@ -443,6 +608,7 @@ func (c *conn) serve() {
 		var closeConn bool
 		backlog, zc, closeConn = c.processBacklog(backlog, tx)
 		if closeConn {
+			LogDebug("slot %d: driver ending: the protocol layer asked to close", c.idx)
 			return
 		}
 	}
@@ -472,8 +638,12 @@ func (c *conn) drainFrames(into [][]byte) [][]byte {
 func (c *conn) processBacklog(backlog [][]byte, tx *Writer) ([][]byte, *ZcReadPlan, bool) {
 	n := 0
 	for n < len(backlog) && n < maxBatchFrames {
-		act, plan := ProcessFrame(c.srv, c.pc, backlog[n], tx)
+		frame := backlog[n]
+		act, plan := ProcessFrame(c.srv, c.pc, frame, tx)
 		n++
+		// The frame is done with: hand its memory reservation back so the
+		// reader can take more requests in.
+		c.releaseFrame(len(frame))
 		c.serviceNotify()
 		switch act {
 		case actionClose:
@@ -519,6 +689,10 @@ func (c *conn) serviceNotify() {
 // then copies the file's bytes straight to the socket, which the Go runtime
 // performs with the kernel splice path (no userspace copy of the file data).
 func (c *conn) sendRead(plan *ZcReadPlan) bool {
+	// The plan holds a reference to its handle (taken under the session lock) so
+	// a concurrent CLOSE cannot close the descriptor mid-read. Give it back on
+	// every path out of here.
+	defer plan.release()
 	n := plan.Length
 	if !plan.Linked {
 		fi, err := plan.File.Stat()
@@ -542,7 +716,7 @@ func (c *conn) sendRead(plan *ZcReadPlan) bool {
 	}
 	// Stream the payload straight from the file to the socket. Reads are
 	// addressed by offset, so the handle's own position is never touched.
-	if err := spliceFileToConn(c.tcp, plan.File, int64(plan.Offset), int(n)); err != nil {
+	if err := spliceFileToConn(c.tcp, plan.File, int64(plan.Offset), int(n), stallTimeout); err != nil {
 		// The header already promised n bytes, so the response stream is
 		// unusable: drop the connection.
 		LogDebug("zerocopy: read failed (%v)", err)
@@ -624,34 +798,66 @@ func (c *conn) readLoop() {
 	var hdr [4]byte
 	for {
 		if _, err := io.ReadFull(c.nc, hdr[:]); err != nil {
+			LogDebug("slot %d: reader ending: %v", c.idx, err)
 			return
 		}
 		// Only NetBIOS session messages are legal on direct TCP 445; anything
 		// else means the stream is desynchronized.
 		if hdr[0] != 0 {
+			LogDebug("slot %d: reader ending: not a NetBIOS session message (%#x)", c.idx, hdr[0])
 			return
 		}
 		flen := int(hdr[1])<<16 | int(hdr[2])<<8 | int(hdr[3])
 		if flen > maxFrame {
+			LogDebug("slot %d: reader ending: frame of %d bytes exceeds %d", c.idx, flen, maxFrame)
 			return
 		}
+		// Reserve the frame's memory *before* allocating it, so a peer that
+		// stops reading its responses cannot make the server buffer unboundedly:
+		// once this connection's budget is spent the reader waits here, leaving
+		// the rest of the request in the socket (where the kernel already bounds
+		// it) instead of in the heap.
+		if !c.rxBudget.Acquire(flen, c.closing) {
+			LogDebug("slot %d: reader ending: could not reserve %d bytes (used %d)",
+				c.idx, flen, c.rxBudget.Used())
+			return
+		}
+		c.rxHeld.Add(int64(flen))
 		frame := make([]byte, flen)
-		if _, err := io.ReadFull(c.nc, frame); err != nil {
+		// A peer that starts a frame must finish it within the timeout.
+		_ = c.nc.SetReadDeadline(time.Now().Add(frameBodyTimeout))
+		_, err := io.ReadFull(c.nc, frame)
+		_ = c.nc.SetReadDeadline(time.Time{})
+		if err != nil {
+			LogDebug("slot %d: reader ending: incomplete frame of %d bytes: %v", c.idx, flen, err)
+			c.releaseFrame(flen)
 			return
 		}
 		select {
 		case c.frames <- frame:
 		case <-c.done:
+			c.releaseFrame(flen)
 			return
 		}
 	}
 }
 
+// releaseFrame returns a request frame's memory reservation.
+func (c *conn) releaseFrame(n int) {
+	c.rxHeld.Add(-int64(n))
+	c.rxBudget.Release(n)
+}
+
+// write sends a response, bounding how long a stalled peer can pin this
+// goroutine. The deadline is re-armed on every write and cleared afterwards, so
+// a client that is slow but making progress is never disconnected.
 func (c *conn) write(b []byte) bool {
 	if len(b) == 0 {
 		return true
 	}
+	_ = c.nc.SetWriteDeadline(time.Now().Add(stallTimeout))
 	_, err := c.nc.Write(b)
+	_ = c.nc.SetWriteDeadline(time.Time{})
 	return err == nil
 }
 
@@ -669,6 +875,11 @@ func (c *conn) shutdown() {
 func (c *conn) teardown() {
 	c.shutdown()
 	c.notifier.stopNow()
+	// Wake the reader if it is parked on the memory budget, and account for
+	// whatever it had reserved: the budget is per connection, so this is the
+	// last chance to give it back.
+	c.rxBudget.Shutdown(int(c.rxHeld.Swap(0)))
+	c.srv.conns.Release()
 	c.srv.leases.ReleaseConn(c.w.id, c.idx, c.gen)
 	for sid := range c.pc.Channels {
 		c.srv.dropChannel(sid)

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -285,13 +287,57 @@ type OpenFile struct {
 	// LeaseGranted is the lease state granted on this handle (0 = none). When it
 	// includes handle-caching the lease persists past CLOSE.
 	LeaseGranted uint32
+	// refs counts operations using File without the session lock; dead is set
+	// by close; closeOnce guarantees the descriptor is closed exactly once.
+	refs      atomic.Int32
+	dead      atomic.Bool
+	closeOnce sync.Once
 }
 
-// close releases the handle's descriptor.
+// use marks the handle as in use for an operation that runs without the session
+// lock (a READ), and returns its file — or nil when the handle is already
+// closed. The caller must call release when it is done.
+//
+// It exists because reads deliberately run with the session lock released, so
+// that channels of one session can read in parallel; a CLOSE on another channel
+// must therefore not pull the descriptor out from under them. use is called
+// with the session lock held (the same lock close takes), so the reference
+// count cannot race with a close.
+func (o *OpenFile) use() *os.File {
+	o.refs.Add(1)
+	if o.dead.Load() {
+		o.release()
+		return nil
+	}
+	return o.File
+}
+
+// release drops a reference taken by use, closing the descriptor if that was
+// the last one and the handle has been closed. An unmatched release (more
+// releases than uses) is tolerated: the count is treated as "nothing
+// outstanding" rather than being allowed to go negative, which would otherwise
+// mean the descriptor never gets closed.
+func (o *OpenFile) release() {
+	if n := o.refs.Add(-1); n <= 0 && o.dead.Load() {
+		o.closeFile()
+	}
+}
+
+// close marks the handle closed and releases the descriptor once no in-flight
+// reference is using it.
 func (o *OpenFile) close() {
+	o.dead.Store(true)
+	if o.refs.Load() <= 0 {
+		o.closeFile()
+	}
+}
+
+// closeFile closes the descriptor exactly once. The File field is never cleared,
+// so a reader that already copied the pointer keeps a usable (or cleanly
+// closed) *os.File rather than a torn value.
+func (o *OpenFile) closeFile() {
 	if o.File != nil {
-		o.File.Close()
-		o.File = nil
+		o.closeOnce.Do(func() { o.File.Close() })
 	}
 }
 
@@ -367,6 +413,9 @@ func (t *HandleTable) slot(id uint64) (int, bool) {
 	return idx, true
 }
 
+// Len reports how many handles are open in the table.
+func (t *HandleTable) Len() int { return len(t.slots) - len(t.free) }
+
 // Get returns the open file for id.
 func (t *HandleTable) Get(id uint64) (*OpenFile, bool) {
 	idx, ok := t.slot(id)
@@ -392,12 +441,16 @@ func (t *HandleTable) Remove(id uint64) (*OpenFile, bool) {
 	return of, true
 }
 
-// CloseAll closes and drops every open handle (session teardown).
+// CloseAll closes and drops every open handle (session teardown). The table is
+// reset rather than merely emptied, so Len reports zero afterwards and every id
+// handed out before the reset misses cleanly.
 func (t *HandleTable) CloseAll() {
-	for i, of := range t.slots {
+	for _, of := range t.slots {
 		if of != nil {
 			of.close()
-			t.slots[i] = nil
 		}
 	}
+	t.slots = nil
+	t.gens = nil
+	t.free = nil
 }

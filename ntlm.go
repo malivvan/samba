@@ -1,6 +1,9 @@
 package samba
 
-import "strings"
+import (
+	"bytes"
+	"strings"
+)
 
 // NTLMSSP: challenge generation, NTLMv2 verification, session key derivation.
 //
@@ -34,33 +37,15 @@ const (
 	TokenOther
 )
 
-// findToken locates an NTLMSSP token inside a raw or SPNEGO-wrapped blob.
+// findToken locates an NTLMSSP token inside a raw or SPNEGO-wrapped blob. The
+// blob is attacker-supplied and can be up to a whole SMB2 frame, so the search
+// uses the standard library's optimized scan rather than a byte-at-a-time loop.
 func findToken(blob []byte) []byte {
-	p := indexOf(blob, ntlmSig)
+	p := bytes.Index(blob, ntlmSig)
 	if p < 0 {
 		return nil
 	}
 	return blob[p:]
-}
-
-// indexOf returns the first index of sep in b, or -1.
-func indexOf(b, sep []byte) int {
-	if len(sep) == 0 {
-		return 0
-	}
-	for i := 0; i+len(sep) <= len(b); i++ {
-		match := true
-		for j := range sep {
-			if b[i+j] != sep[j] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return i
-		}
-	}
-	return -1
 }
 
 // classifyToken reports which NTLMSSP message kind a blob carries.

@@ -152,6 +152,13 @@ func ccmSeal(block cipher.Block, nonce, aad, buf []byte, tagLen int) ([16]byte, 
 	if err != nil {
 		return [16]byte{}, err
 	}
+	// The message length is encoded in L octets; a longer message would be
+	// encoded with the high bits silently dropped, which would authenticate the
+	// wrong length. SMB3 payloads never approach this, but the primitive should
+	// not pretend to seal what it cannot length-encode.
+	if uint64(len(buf)) >= uint64(1)<<(8*uint(l)) {
+		return [16]byte{}, errors.New("ccm: message too long for the nonce length")
+	}
 	tag := ccmComputeTag(block, nonce, aad, buf, tagLen, l)
 	ccmCrypt(block, nonce, buf, l)
 	return tag, nil

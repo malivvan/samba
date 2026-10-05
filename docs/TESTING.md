@@ -37,7 +37,28 @@ loop, not an occasional extra.
 | `netinfo_test.go` | `NETWORK_INTERFACE_INFO` encoding (152 bytes per interface, `Next` chain, link speed, IPv4/IPv6 family), interface enumeration |
 | `handlers_test.go` | `RqLs` lease-context parsing (v1, v2, non-lease, truncated, no-progress `Next`), OPLOCK_BREAK frame shape, CHANGE_NOTIFY completion framing and its degrade-to-re-enumerate behaviour |
 | `smb2_test.go` | The protocol end to end through `ProcessFrame`: a full session (negotiate → session setup → tree connect → create → write → read → query directory → close), traversal rejection, the zero-copy read plan, NTLMv2 authentication with signing enforcement and response-signature verification, SMB 3.1.1 preauth chaining with an independently recomputed signing key, transform round trip plus tamper, response batching, SMB1 wildcard, undecryptable-frame disconnect, credit clamping |
+| `commands_test.go` | Every SMB2 command on a real session: NEGOTIATE variants and cipher choice, the session-setup policy and multichannel binding, TREE_CONNECT/DISCONNECT (including the `IPC$` stub), every CREATE disposition and its errors, READ/WRITE/FLUSH/CLOSE, every QUERY_INFO and SET_INFO class, all six QUERY_DIRECTORY classes plus continuation and restart, LOCK (shared, exclusive, unlock, conflicts, batch unwind), IOCTL, CHANGE_NOTIFY, LOGOFF, compounds, and lease grants |
+| `malformed_test.go` | Every request truncated at every length: the server must answer with a protocol error, never panic, never accept garbage and never drop the connection — the error branch of every body decoder in one sweep |
+| `auth_test.go` | The session-setup branches: SPNEGO wrapping, re-authentication, guest and anonymous decisions, encryption-required refusals, mechanism policy, and the full multichannel channel-binding handshake (accepted, rejected, and guest) |
+| `krb5_test.go` | A complete Kerberos login built from a real keytab and AP-REQ (ticket decryption, authenticator, sub-session key as the SMB session key, signing, SPNEGO wrapping), a foreign keytab rejected, and the acceptor's failure and policy paths |
+| `limits_test.go`, `caps_test.go` | The resource limits and the budget's blocking/shutdown semantics, and the protocol-level refusal of each cap |
+| `hardening_test.go` | The transport's hardening: the connection cap, incomplete-frame reaping, the zero-copy stall deadline and its correctness, break routing, deferred-frame writing, panic containment, and clean shutdown |
+| `edge_test.go` | The remaining edges: AEAD and CMAC error paths, the CCM length-prefix forms, `clamp`/`isHex`, handle-table misses, the response write stall, and path/metadata variants |
 | `server_test.go` | The same things over a real socket: framing, batched pipelining, the zero-copy read path at several offsets (in a deliberately non-sequential order), IOCTL FSCTLs, a CHANGE_NOTIFY that completes from a real inotify event, **a lease break delivered to the other client**, and rejection of a desynchronized stream |
+
+## Coverage
+
+```sh
+go test -coverprofile=/tmp/cov.out ./... && go tool cover -func=/tmp/cov.out | tail -1
+```
+
+Statement coverage is **94%** across the module (and 89% for the CLI). The
+remaining lines are error branches that cannot be reached on a working system
+(an unreadable `/sys/class/net/*/speed`, a filesystem reporting a zero fragment
+size, `crypto/rand` failing, a `poll(2)` error other than `EINTR`), or defensive
+paths whose trigger would be a bug elsewhere. Coverage was raised by writing
+tests for behaviour a client depends on — statuses, byte layouts, error
+classification — not by chasing lines.
 
 ## Fuzzing
 

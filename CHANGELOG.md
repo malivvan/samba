@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 conventional commits.
 
+## [Unreleased]
+
+### Security and stability review
+
+A full review of the package (see [REVIEW.md](REVIEW.md)) found and fixed 22
+issues, most of them ways a single peer could exhaust a shared resource or hold
+one forever:
+
+- **Resource limits** (`limits.go`): connections (`max_connections`, default
+  512), sessions per connection and overall, open handles per session, tree
+  connects, pending `CHANGE_NOTIFY` (which cost kernel inotify watches), leases
+  per file and overall, and the buffered request bytes a connection may hold
+  (one maximum-size frame — previously a peer could make the server buffer
+  ~275 MiB per connection by not reading its responses).
+- **Timeouts**: an incomplete frame must be finished within 5 minutes, a stalled
+  response write is abandoned after 5 minutes without progress, and the
+  zero-copy read pump gives up on a peer that stops making progress. An idle
+  connection is never disconnected.
+- **Panic isolation**: each connection and worker iteration now runs under a
+  guard that logs the panic with a stack trace and tears down only that
+  connection, so one malformed frame can no longer take the process (and every
+  other client) down.
+- **Log flooding**: warn-level output is rate limited, with a summary of how
+  many messages were suppressed, so a peer cannot fill a log filesystem.
+- **Read/close race**: a READ in flight on one channel is no longer cut short by
+  a CLOSE on another (`OpenFile` reference counting).
+- **Kerberos**: the acceptor (and its keytab read) is built once per server
+  instead of once per logon, and an unusable keytab is reported at startup.
+- Smaller fixes: no whole-directory read to test a directory for emptiness, an
+  AES-CCM length-field guard, an optimized NTLMSSP token search, a stale handle
+  count after bulk-closing a session, and a data race on the listener field.
+
+### Tests
+
+Test coverage went from 68% to 94% of statements, driven by tests for behaviour
+rather than line counts: every SMB2 command and its parameter validation, every
+decoder's error path (a truncation sweep), the session-setup policy and
+multichannel binding paths, a complete Kerberos login built from a real keytab
+and AP-REQ, the notifier and its inotify parsing, the resource limits, the
+timeout/panic/reconnect paths, and the CLI.
+
 ## [1.4.0] — 2026-10-05
 
 First release of the Go implementation: a complete port of the SMB2/SMB3 server

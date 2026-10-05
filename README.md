@@ -147,6 +147,7 @@ full example is in [`samba.toml.example`](samba.toml.example).
 | `multichannel` | `false` | Advertise SMB3 multichannel and accept session binding. |
 | `advertise_only` | `[]` | Addresses to advertise for multichannel; empty = every non-loopback interface. |
 | `oplocks` | `true` | Grant leases: read-caching and handle-caching (R/RH). Write-caching is never granted. |
+| `max_connections` | `512` | Concurrent connections the server will serve. The main lever on worst-case memory use; `-1` removes the limit. |
 | `auth` | `"both"` | `"ntlm"`, `"kerberos"` or `"both"` (Kerberos preferred). |
 | `[kerberos]` | absent | `enabled` (default true), `keytab` (default `$KRB5_KTNAME`, then `/etc/krb5.keytab`), `spn` (default `cifs/<server_name>`), `realm` (parsed; the realm actually comes from the ticket). |
 | `[[share]]` | at least one required | `name`, `path` (must be an existing directory), `read_only` (default false). `IPC$` is reserved. |
@@ -168,6 +169,32 @@ password = "secret"        # or: nt_hash = "<32 hex chars>"
 ```
 
 Run it with `samba --config /etc/samba/samba.toml`.
+
+### Resource limits
+
+Every client-controllable resource is bounded, so one misbehaving peer cannot
+take the server down for everyone else. The limits are generous enough that no
+real client notices them, and hitting one is a protocol error for that client
+(`STATUS_INSUFFICIENT_RESOURCES`), never a crash or a wild allocation:
+
+| Limit | Value | Why |
+|---|---|---|
+| `max_connections` | 512 | Goroutines, descriptors and buffered requests per connection. |
+| request bytes buffered per connection | one maximum frame (4.4 MiB) | A peer that stops reading cannot make the server buffer unboundedly. |
+| sessions per connection | 64 | One session per connection is the norm; this stops one peer draining the server. |
+| sessions overall | 65536 | Each carries a handle table. |
+| open handles per session | 16384 | Protects the process descriptor table. |
+| tree connects per session | 4096 | — |
+| pending `CHANGE_NOTIFY` per connection | 256 | Each costs an inotify watch, and the kernel budget is per-user. |
+| leases per file / overall | 64 / 65536 | Handle-caching leases outlive CLOSE. |
+| `QUERY_DIRECTORY` pattern length | 255 characters | Windows' own limit, and it bounds wildcard matching. |
+
+Timeouts bound the other direction: a peer that starts a frame and stops has 5
+minutes to finish it, a peer that stops reading a response has 5 minutes per
+write, and a zero-copy read is abandoned if it makes no progress for 5 minutes.
+An idle connection is never disconnected. See
+[REVIEW.md](REVIEW.md) for the review that produced these numbers and
+[docs/TUNING.md](docs/TUNING.md) for sizing advice.
 
 ## Mounting
 

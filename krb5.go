@@ -212,24 +212,14 @@ func kerberosSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain 
 	dialect := pc.Dialect
 	cipher := pc.Cipher
 
-	// Lazily acquire the acceptor credential for this connection.
+	// Resolve the (shared) acceptor credential once per connection.
 	if pc.krbAcceptor == nil {
-		kcfg := srv.cfg.Kerberos
-		if kcfg != nil && kcfg.Enabled != nil && !*kcfg.Enabled {
+		if kcfg := srv.cfg.Kerberos; kcfg != nil && kcfg.Enabled != nil && !*kcfg.Enabled {
 			LogWarn("kerberos: token received but [kerberos].enabled = false")
 			errResp(tx, h, StatusNotSupported, chain)
 			return
 		}
-		spn := ""
-		keytabPath := ""
-		if kcfg != nil {
-			spn = kcfg.SPN
-			keytabPath = kcfg.Keytab
-		}
-		if spn == "" {
-			spn = "cifs/" + srv.cfg.ServerName
-		}
-		acc, err := NewKerberosAcceptor(spn, keytabPath)
+		acc, err := srv.kerberosAcceptor()
 		if err != nil {
 			LogWarn("kerberos: acceptor init failed (%v)", err)
 			errResp(tx, h, StatusLogonFailure, chain)
@@ -256,7 +246,17 @@ func kerberosSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain 
 	copy(key[:], est.SessionKey[:n])
 
 	// Fresh session; chain the 3.1.1 preauth over this single setup message.
-	sid, sref := srv.sessions.Create()
+	if len(pc.Channels) >= maxSessionsPerConn {
+		LogWarn("refusing a session: %d already set up on this connection", len(pc.Channels))
+		errResp(tx, h, StatusInsufficientResources, chain)
+		return
+	}
+	sid, sref, created := srv.sessions.Create()
+	if !created {
+		LogWarn("refusing a session: the server is at its session limit (%d)", maxSessionsTotal)
+		errResp(tx, h, StatusInsufficientResources, chain)
+		return
+	}
 	chain.SessionID = sid
 	var chPreauth [64]byte
 	if dialect == 0x0311 {

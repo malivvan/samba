@@ -13,6 +13,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime"
@@ -24,61 +25,69 @@ import (
 const usage = "usage: samba [--config <path>] [--check] [--version]"
 
 func main() {
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, sigs))
+}
+
+// run parses the command line, loads the configuration and runs the server
+// until sigs yields a signal (or is closed). It returns the process exit
+// status: 0 for success, 2 for a usage, configuration or startup error.
+func run(args []string, stdout, stderr io.Writer, sigs <-chan os.Signal) int {
 	configPath := "samba.toml"
 	checkOnly := false
 
-	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--config", "-c":
 			if i+1 >= len(args) {
-				die(usage)
+				return fail(stderr, usage)
 			}
 			i++
 			configPath = args[i]
 		case "--check":
 			checkOnly = true
 		case "--version", "-V":
-			fmt.Printf("samba %s\n", samba.Version)
-			return
+			fmt.Fprintf(stdout, "samba %s\n", samba.Version)
+			return 0
 		default:
-			die(usage)
+			return fail(stderr, usage)
 		}
 	}
 
 	cfg, err := samba.LoadConfig(configPath)
 	if err != nil {
-		die(err.Error())
+		return fail(stderr, err.Error())
 	}
 	samba.SetLogLevel(cfg.LogLevel)
 	if checkOnly {
-		fmt.Printf("config ok: %d share(s)\n", len(cfg.Shares))
-		return
+		fmt.Fprintf(stdout, "config ok: %d share(s)\n", len(cfg.Shares))
+		return 0
 	}
-
-	if err := run(cfg); err != nil {
-		die(err.Error())
+	if err := serve(cfg, sigs); err != nil {
+		return fail(stderr, err.Error())
 	}
+	return 0
 }
 
-func die(msg string) {
-	fmt.Fprintf(os.Stderr, "samba: %s\n", msg)
-	os.Exit(2)
+func fail(stderr io.Writer, msg string) int {
+	fmt.Fprintf(stderr, "samba: %s\n", msg)
+	return 2
 }
 
-func run(cfg *samba.Config) error {
+// serve starts the server, reports what it is serving, and blocks until the
+// signal channel yields or is closed.
+func serve(cfg *samba.Config, sigs <-chan os.Signal) error {
 	srv, err := samba.NewServer(cfg)
 	if err != nil {
 		return err
 	}
-	users := cfg.Users
-	allowGuest := cfg.GuestAllowed()
-	if len(users) > 0 {
+	if allowGuest := cfg.GuestAllowed(); len(cfg.Users) > 0 {
 		guest := "denied"
 		if allowGuest {
 			guest = "allowed"
 		}
-		samba.LogInfo("%d user(s) loaded, guest %s", len(users), guest)
+		samba.LogInfo("%d user(s) loaded, guest %s", len(cfg.Users), guest)
 	}
 	if cfg.Multichannel {
 		var advertised []string
@@ -100,11 +109,9 @@ func run(cfg *samba.Config) error {
 		"samba %s listening on %s (%d workers, max_read %d KiB)",
 		samba.Version, cfg.Listen, workers, samba.MaxReadTarget/1024,
 	)
-
-	// Run until interrupted.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	<-sigs
+	if sigs != nil {
+		<-sigs
+	}
 	samba.LogInfo("shutting down")
 	srv.Stop()
 	srv.Wait()

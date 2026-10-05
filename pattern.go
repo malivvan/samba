@@ -24,7 +24,8 @@ import "strings"
 // clients that care can see the long name in the directory listing.
 
 // matchPattern reports whether name matches the SMB search pattern pattern.
-// Matching is rune-wise and case-insensitive.
+// Matching is rune-wise and case-insensitive. Callers bound the pattern length
+// (see maxSearchPatternRunes) so the backtracking search stays cheap.
 func matchPattern(pattern, name string) bool {
 	p := []rune(strings.ToLower(pattern))
 	n := []rune(strings.ToLower(name))
@@ -57,10 +58,4 @@ func matchPattern(pattern, name string) bool {
 		pi++
 	}
 	return pi == len(p)
-}
-
-// hasWildcard reports whether a search pattern needs matching rather than a
-// plain comparison.
-func hasWildcard(pattern string) bool {
-	return strings.ContainsAny(pattern, "*?")
 }

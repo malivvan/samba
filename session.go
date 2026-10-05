@@ -45,11 +45,12 @@ type Registry struct {
 	mu     sync.Mutex
 	byID   map[uint64]*Session
 	nextID atomic.Uint64
+	limit  int
 }
 
 // NewRegistry returns an empty session registry.
 func NewRegistry() *Registry {
-	r := &Registry{byID: make(map[uint64]*Session)}
+	r := &Registry{byID: make(map[uint64]*Session), limit: maxSessionsTotal}
 	// Start high and odd so ids look like real SMB session handles and never
 	// collide with the 0 / all-ones sentinels.
 	r.nextID.Store(0x1000_0000_0001)
@@ -57,13 +58,20 @@ func NewRegistry() *Registry {
 }
 
 // Create allocates a fresh session and inserts an empty (un-established) entry.
-func (r *Registry) Create() (uint64, *Session) {
+// It reports false when the server is already holding its maximum number of
+// sessions: a session costs a handle table and a tree map, and a client can ask
+// for sessions faster than it asks for anything else, so the count needs a
+// bound.
+func (r *Registry) Create() (uint64, *Session, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.byID) >= r.limit {
+		return 0, nil, false
+	}
 	id := r.nextID.Add(2)
 	s := newSession()
-	r.mu.Lock()
 	r.byID[id] = s
-	r.mu.Unlock()
-	return id, s
+	return id, s, true
 }
 
 // Get returns the session for id.
