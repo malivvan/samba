@@ -172,6 +172,25 @@ func smb311EncryptionKeys(cipher uint16, sessionKey *[16]byte, preauth *[64]byte
 	return c2s, s2c
 }
 
+// smb3EncryptionKeys derives the SMB 3.0 and 3.0.2 encryption keys from the
+// session key (MS-SMB2 3.1.4.2). That dialect family has no preauth hash, so the
+// KDF context is a constant direction string instead, and the cipher is fixed at
+// AES-128-CCM — there is no cipher negotiation before 3.1.1, which is why the
+// key length is not a parameter here.
+//
+// Note the trailing space in the "ServerIn " context. It is in the spec, every
+// other implementation carries it, and a key derived without it silently never
+// interoperates.
+func smb3EncryptionKeys(sessionKey *[16]byte) (c2s, s2c [32]byte) {
+	const keyBits = 128
+	label := []byte("SMB2AESCCM\x00")
+	c := kdf(sessionKey[:], label, []byte("ServerIn \x00"), keyBits)
+	s := kdf(sessionKey[:], label, []byte("ServerOut\x00"), keyBits)
+	copy(c2s[:], c)
+	copy(s2c[:], s)
+	return c2s, s2c
+}
+
 // aeadSeal encrypts buf in place for cipher and returns the 16-byte tag.
 // key/nonce must be the cipher's correct length; aad is the authenticated
 // TRANSFORM_HEADER bytes.

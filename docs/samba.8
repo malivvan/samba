@@ -116,9 +116,20 @@ Allow unauthenticated guest sessions. Defaults to true only when no
 .B require_signing
 Reject unsigned requests on authenticated sessions.
 .TP
+.B min_dialect
+Oldest SMB dialect to negotiate: \fB"2.0.2"\fR (the default), \fB"2.1"\fR,
+\fB"3.0"\fR, \fB"3.0.2"\fR or \fB"3.1.1"\fR. A client that offers nothing at or
+above the floor is refused with STATUS_NOT_SUPPORTED rather than downgraded to a
+dialect the operator excluded. SMB 2.x has no encryption and no downgrade
+protection, so \fB"3.0"\fR is the setting that removes both.
+.TP
 .B encrypt
 Require SMB3 encryption on all post-authentication traffic. Default false;
 encryption a client asks for (e.g. cifs \fBseal\fR) is honored either way.
+Setting it also raises \fBmin_dialect\fR to \fB"3.0"\fR, since 2.x cannot
+encrypt, and refuses any session the server cannot encrypt instead of serving it
+in the clear. Combining it with an explicit 2.x \fBmin_dialect\fR is a
+configuration error.
 .TP
 .B prefer_aes256
 Prefer AES-256 (GCM, then CCM) when the client offers it, instead of honoring
@@ -205,13 +216,19 @@ Clean shutdown, or a successful reporting command.
 .B 2
 A usage error, a configuration error, or a startup failure.
 .SH SECURITY
+The goal of this server is to be safe to expose to the public internet, and two
+settings carry most of that weight: \fBmin_dialect\fR refuses old dialects
+instead of downgrading to them, and \fBencrypt\fR refuses any session it cannot
+encrypt. SMB 2.x has neither encryption nor downgrade protection. SMB1 is not
+implemented and never will be.
+.PP
 Authorization is \fBshare-level only\fR: \fBread_only\fR applies to every user,
 and all file I/O runs as the server's Unix user. Role-based access, per-share
 user lists and SID-to-uid mapping are not implemented. Run the server as a
 dedicated unprivileged user that owns only the share trees. Symlinks inside a
 share are followed even when they point outside it, as in Samba's \fBwide
-links\fR. No external security review has been done; do not expose port 445 to
-the public internet. See
+links\fR. No external security review has been done, so treat the goal above as
+the direction of travel rather than a warranty. See
 .I SECURITY.md.
 .SH SEE ALSO
 .BR smbd (8),

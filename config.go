@@ -50,6 +50,13 @@ type Config struct {
 	// the main lever on worst-case memory use (see the tuning notes); a negative
 	// value removes the limit.
 	MaxConnections *int `toml:"max_connections"`
+	// MinDialect is the oldest SMB dialect the server will negotiate, spelled as
+	// in Dialect.Version ("2.0.2" through "3.1.1"). Empty means the default, and
+	// is raised to 3.0 when Encrypt is set. A client that offers nothing at or
+	// above the floor is refused rather than downgraded to a dialect the
+	// operator excluded, which is what makes the floor a guarantee and not a
+	// preference.
+	MinDialect string `toml:"min_dialect"`
 	// Shares and Users are the [ [share] ] / [ [user] ] tables.
 	Shares []ShareCfg `toml:"share"`
 	Users  []UserCfg  `toml:"user"`
@@ -156,7 +163,41 @@ func (c *Config) validate() error {
 			return fmt.Errorf("user %q: set exactly one of password / nt_hash (32 hex chars)", u.Name)
 		}
 	}
+	if c.MinDialect != "" {
+		d, ok := DialectByName(c.MinDialect)
+		if !ok {
+			return fmt.Errorf("invalid min_dialect %q: want one of %s",
+				c.MinDialect, strings.Join(DialectNames(), ", "))
+		}
+		// `encrypt = true` below SMB 3.0 is a contradiction, not a preference:
+		// 2.x has no encryption at all, so such a server would negotiate a
+		// cleartext session while claiming to require encryption. Refuse it
+		// here rather than quietly raising the floor, so the operator's
+		// explicit setting is never silently overridden.
+		if c.Encrypt && d.Revision < dialectFloorOrPanic(EncryptionMinDialect).Revision {
+			return fmt.Errorf("min_dialect = %q cannot be combined with encrypt = true: SMB 2.x has no encryption, so the server would serve those clients in the clear (set min_dialect = %q, or drop encrypt)",
+				c.MinDialect, EncryptionMinDialect)
+		}
+	}
 	return nil
+}
+
+// DialectFloor is the oldest dialect the server negotiates.
+//
+// It is `min_dialect` when set, and otherwise the default — raised to SMB 3.0
+// when `encrypt` is set, because below 3.0 there is nothing to encrypt with.
+// validate() rejects the case where those two disagree explicitly; this resolves
+// the case where `min_dialect` was simply left out.
+func (c *Config) DialectFloor() Dialect {
+	if c.MinDialect != "" {
+		if d, ok := DialectByName(c.MinDialect); ok {
+			return d
+		}
+	}
+	if c.Encrypt {
+		return dialectFloorOrPanic(EncryptionMinDialect)
+	}
+	return dialectFloorOrPanic(DefaultMinDialect)
 }
 
 func isHex(s string) bool {

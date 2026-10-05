@@ -164,21 +164,50 @@ func (s *sessionSetupCtx) establish(authed sessionAuth) {
 	sc := deriveSignCtx(dialect, &authed.Key, &chPreauth)
 	ch.Sign = &sc
 
-	// SMB3 encryption: derive the keys when a cipher was negotiated. If the
-	// server requires encryption, set ENCRYPT_DATA so the client seals all
-	// subsequent traffic; otherwise stay ready to honor client-initiated
-	// encryption (e.g. cifs `seal`).
+	// SMB3 encryption: derive this channel's keys. If the server requires
+	// encryption, set ENCRYPT_DATA so the client seals all subsequent traffic;
+	// otherwise stay ready to honor client-initiated encryption (cifs `seal`).
+	ch.Enc = channelEncryption(dialect, cipher, &authed.Key, &chPreauth)
+	if ch.Enc == nil && s.srv.cfg.Encrypt {
+		// The backstop that makes `encrypt = true` a guarantee rather than a
+		// hope: a session this server cannot encrypt — a dialect that has no
+		// encryption, or a client that negotiated none — is refused instead of
+		// being served in the clear. min_dialect keeps this unreachable for the
+		// dialects we know about; it is what covers the ones we do not.
+		LogWarn("session %x: refusing a session that cannot be encrypted (dialect %#x, cipher %#x) while encrypt = true",
+			sid, dialect, cipher)
+		s.rejectSessionSetup(StatusNotSupported)
+		return
+	}
 	var flags uint16
-	if cipher != 0 && dialect == 0x0311 {
-		c2s, s2c := smb311EncryptionKeys(cipher, &authed.Key, &chPreauth)
-		ch.Enc = &EncCtx{Cipher: cipher, C2S: c2s, S2C: s2c}
-		if s.srv.cfg.Encrypt {
-			ch.Encrypt = true
-			flags |= sessionFlagEncryptData
-		}
+	if ch.Enc != nil && s.srv.cfg.Encrypt {
+		ch.Encrypt = true
+		flags |= sessionFlagEncryptData
 	}
 	logSessionEstablished(sid, authed.User, s.signReqd, ch.Enc != nil)
 	ssResp(s.tx, s.h, StatusSuccess, s.chain.Related, sid, flags, authed.Token)
+}
+
+// channelEncryption returns the encryption context for a session key on the
+// negotiated dialect, or nil when that session cannot be encrypted: SMB 2.x has
+// no encryption at all, and a 3.x session negotiated without a cipher has none
+// either.
+//
+// The two dialect families derive their keys differently — 3.1.1 mixes in the
+// preauth hash and negotiates a cipher, 3.0/3.0.2 fixes AES-128-CCM and has no
+// preauth — so the split lives here rather than at each call site, and the
+// session-establishment and channel-binding paths cannot disagree about it.
+func channelEncryption(dialect, cipher uint16, key *[16]byte, preauth *[64]byte) *EncCtx {
+	if cipher == 0 || dialect < 0x0300 {
+		return nil
+	}
+	var c2s, s2c [32]byte
+	if dialect == 0x0311 {
+		c2s, s2c = smb311EncryptionKeys(cipher, key, preauth)
+	} else {
+		c2s, s2c = smb3EncryptionKeys(key)
+	}
+	return &EncCtx{Cipher: cipher, C2S: c2s, S2C: s2c}
 }
 
 // logSessionEstablished reports one successful session setup, in the same shape

@@ -60,6 +60,10 @@ const (
 	capLeasing      uint32 = 0x2
 	capLargeMTU     uint32 = 0x4
 	capMultiChannel uint32 = 0x8
+	// capEncryption is SMB2_GLOBAL_CAP_ENCRYPTION. It is the pre-3.1.1 way for a
+	// client to say it can seal and for the server to agree; from 3.1.1 the
+	// cipher is negotiated in a negotiate context instead.
+	capEncryption uint32 = 0x40
 
 	securityModeSigningEnabled  uint16 = 0x1
 	securityModeSigningRequired uint16 = 0x2
@@ -311,31 +315,47 @@ func putFID(tx *Writer, fid uint64) {
 // ---------------------------------------------------------------- NEGOTIATE
 
 func negotiate(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Chain, tx *Writer) {
-	body := msg[64:]
-	dialects, ctxOff, ctxCount, ok := parseNegotiateReq(body)
+	req, ok := parseNegotiateReq(msg[64:])
 	if !ok {
 		errResp(tx, h, StatusInvalidParameter, chain)
 		return
 	}
+
+	// Take the newest dialect the client offers that is at or above the
+	// configured floor. A client offering nothing at or above it is refused
+	// rather than downgraded, which is what makes min_dialect a guarantee — and
+	// `encrypt = true` implies a floor of SMB 3.0, because 2.x cannot encrypt at
+	// all and would otherwise negotiate a cleartext session on a server that
+	// requires encryption.
+	floor := srv.cfg.DialectFloor()
 	chosen := uint16(0)
 	for _, d := range supportedDialects {
-		if containsU16(dialects, d) {
+		if d < floor.Revision {
+			continue
+		}
+		if containsU16(req.Dialects, d) {
 			chosen = d
 			break
 		}
 	}
 	if chosen == 0 {
+		LogWarn("negotiate: refused, the client offers no dialect at or above min_dialect %s", floor.Version)
 		errResp(tx, h, StatusNotSupported, chain)
 		return
 	}
 
-	// For 3.1.1, require the preauth integrity context (SHA-512) and pick a
-	// cipher from the client's encryption capabilities.
+	// The cipher. SMB 3.1.1 negotiates it in a negotiate context, and requires
+	// the SHA-512 preauth context alongside; 3.0 and 3.0.2 have no cipher
+	// context at all and are fixed at AES-128-CCM by the spec; 2.x has no
+	// encryption and so no cipher.
 	cipher := uint16(0)
-	if chosen == 0x0311 {
+	switch chosen {
+	case 0x0300, 0x0302:
+		cipher = CipherAES128CCM
+	case 0x0311:
 		havePreauth := false
-		off := ctxOff
-		for range min(ctxCount, 16) {
+		off := req.CtxOff
+		for range min(req.CtxCount, 16) {
 			t, dataLen, ok := parseNegotiateContext(msg, off)
 			if !ok {
 				break
@@ -361,41 +381,60 @@ func negotiate(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Chain, tx 
 		LogDebug("negotiated dialect %#x cipher %#x", chosen, cipher)
 	}
 	start := beginResp(tx, h, StatusSuccess, false, 0, 0)
-	negotiateBody(srv, pc, chosen, cipher, start, tx)
+	negotiateBody(srv, pc, chosen, cipher, req.Capabilities, start, tx)
 }
 
-func parseNegotiateReq(body []byte) (dialects []uint16, ctxOff uint32, ctxCount uint16, ok bool) {
+// negotiateReq is a decoded SMB2 NEGOTIATE request.
+type negotiateReq struct {
+	// Dialects is the client's offered revisions, in its preference order.
+	Dialects []uint16
+	// Capabilities is the client's SMB2_GLOBAL_CAP_* set.
+	Capabilities uint32
+	// CtxOff and CtxCount locate the negotiate contexts (SMB 3.1.1).
+	CtxOff   uint32
+	CtxCount uint16
+}
+
+func parseNegotiateReq(body []byte) (negotiateReq, bool) {
+	var req negotiateReq
 	r := NewReader(body)
 	if v, ok := r.U16(); !ok || v != 36 {
-		return nil, 0, 0, false
+		return req, false
 	}
 	count, ok := r.U16()
 	if !ok {
-		return nil, 0, 0, false
+		return req, false
 	}
-	if !r.Skip(2 + 2 + 4 + 16) { // security mode, reserved, capabilities, guid
-		return nil, 0, 0, false
+	if !r.Skip(2 + 2) { // security mode, reserved
+		return req, false
 	}
-	ctxOff, ok = r.U32()
+	req.Capabilities, ok = r.U32()
 	if !ok {
-		return nil, 0, 0, false
+		return req, false
 	}
-	ctxCount, ok = r.U16()
+	if !r.Skip(16) { // client guid
+		return req, false
+	}
+	req.CtxOff, ok = r.U32()
 	if !ok {
-		return nil, 0, 0, false
+		return req, false
+	}
+	req.CtxCount, ok = r.U16()
+	if !ok {
+		return req, false
 	}
 	if !r.Skip(2) {
-		return nil, 0, 0, false
+		return req, false
 	}
 	n := min(int(count), 16)
 	for range n {
 		d, ok := r.U16()
 		if !ok {
-			return nil, 0, 0, false
+			return req, false
 		}
-		dialects = append(dialects, d)
+		req.Dialects = append(req.Dialects, d)
 	}
-	return dialects, ctxOff, ctxCount, true
+	return req, true
 }
 
 // parseNegotiateContext reads one SMB2_NEGOTIATE_CONTEXT header.
@@ -489,10 +528,13 @@ func chooseCipher(srv *Srv, msg []byte, off uint32, dataLen int) uint16 {
 func negotiateRespSMB1Wildcard(srv *Srv, pc *ProtoConn, tx *Writer) {
 	h := &ReqHdr{Credits: 1, Command: CmdNegotiate}
 	start := beginResp(tx, h, StatusSuccess, false, 0, 0)
-	negotiateBody(srv, pc, 0x02FF, 0, start, tx)
+	negotiateBody(srv, pc, 0x02FF, 0, 0, start, tx)
 }
 
-func negotiateBody(srv *Srv, pc *ProtoConn, dialect, cipher uint16, respStart int, tx *Writer) {
+// negotiateBody writes the NEGOTIATE response. clientCaps is the capability set
+// the client asked for, which decides whether the encryption capability is
+// echoed back.
+func negotiateBody(srv *Srv, pc *ProtoConn, dialect, cipher uint16, clientCaps uint32, respStart int, tx *Writer) {
 	secmode := securityModeSigningEnabled
 	if srv.cfg.RequireSigning {
 		secmode |= securityModeSigningRequired
@@ -513,6 +555,13 @@ func negotiateBody(srv *Srv, pc *ProtoConn, dialect, cipher uint16, respStart in
 	caps := capLargeMTU
 	if dialect >= 0x0300 && srv.cfg.Multichannel {
 		caps |= capMultiChannel
+	}
+	// ENCRYPTION tells a 3.0/3.0.2 client the server can seal, which is what a
+	// client-requested (`seal`) mount needs; the spec has the server echo the
+	// bit the client set. From 3.1.1 the same thing is signalled by offering a
+	// cipher in the encryption negotiate context instead, so the bit is not used.
+	if dialect >= 0x0300 && dialect != 0x0311 && clientCaps&capEncryption != 0 {
+		caps |= capEncryption
 	}
 	// Advertise leasing (SMB 2.1+) so clients request leases (RqLs) instead of
 	// legacy oplocks; the caching/break path is lease-based.
@@ -756,18 +805,24 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 				sc := deriveSignCtx(dialect, &key, &chPreauth)
 				chm.Sign = &sc
 			}
-			// This channel's own encryption keys (per-connection preauth).
+			// This channel's own encryption keys. They are derived from the
+			// session's key but from *this* channel's preauth hash, so a bound
+			// channel is not a copy of the first one.
+			chm.Enc = channelEncryption(dialect, cipher, &key, &chPreauth)
 			var flags uint16
 			if guest {
 				flags = sessionFlagIsGuest
 			}
-			if !guest && cipher != 0 && dialect == 0x0311 {
-				c2s, s2c := smb311EncryptionKeys(cipher, &key, &chPreauth)
-				chm.Enc = &EncCtx{Cipher: cipher, C2S: c2s, S2C: s2c}
-				if srv.cfg.Encrypt {
-					chm.Encrypt = true
-					flags |= sessionFlagEncryptData
-				}
+			if !guest && srv.cfg.Encrypt && chm.Enc == nil {
+				LogWarn("session %x: refusing a channel bind that cannot be encrypted (dialect %#x, cipher %#x) while encrypt = true",
+					sid, dialect, cipher)
+				delete(pc.Channels, sid)
+				errResp(tx, h, StatusNotSupported, chain)
+				return
+			}
+			if chm.Enc != nil && srv.cfg.Encrypt {
+				chm.Encrypt = true
+				flags |= sessionFlagEncryptData
 			}
 			LogInfo("session %x: channel bound (now striping)", sid)
 			ssResp(tx, h, StatusSuccess, chain.Related, sid, flags, done)

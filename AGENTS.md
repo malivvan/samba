@@ -5,6 +5,30 @@ Go**. It parses untrusted network input and then serves files, so two rules
 dominate every change: stay memory safe, and never trust a length, offset or
 count that arrived on the wire.
 
+## Goal: safe on the public internet
+
+**The point of this project is a file server you can expose to the public
+internet without putting the host at risk.** That is the objective every design
+trade-off here is measured against, and it has concrete consequences:
+
+- Compatibility is not a reason to accept a weakness. Where an old protocol or
+  cipher exists only so that a legacy peer can connect, the answer is to refuse
+  the peer, not to weaken the server. **SMB1 is not supported and never will
+  be**: its useful surface is a catalogue of historical vulnerabilities and
+  every client that matters has spoken SMB2/3 for years. Today an SMB1 NEGOTIATE
+  gets the SMB2 wildcard so an SMB1-only client times out; refusing it explicitly
+  is a roadmap item, not a feature request.
+- A security setting is a **guarantee, not a hint**. `min_dialect` refuses a
+  client below the floor rather than downgrading to it, and `encrypt = true`
+  refuses a session it cannot encrypt rather than serving it in the clear. If
+  you add a knob, make the weak branch impossible rather than unlikely.
+- Being *reachable* is the design point, so the limits (see `limits.go`) and the
+  panic guards are load-bearing, not defensive decoration.
+
+**This is an objective, not yet a warranty.** No external security review has
+been done — it is the top item in ROADMAP.md — and nothing in this repository
+should be read as claiming otherwise. Keep SECURITY.md honest about that.
+
 ## Version
 
 - Current: **1.4.0**, reported by the `Version` constant in `doc.go` (the single
@@ -84,9 +108,9 @@ for where each concern lives:
 | `crypto.go`, `cmac.go`, `ccm.go`, `md4.go` | signing, KDF and AEAD primitives |
 | `ntlm.go`, `spnego.go` | NTLMv2 and the SPNEGO glue that classifies the security blob |
 | `auth.go` | session establishment, shared by every mechanism |
-| `config.go` | TOML configuration and the resolved server context |
+| `config.go` | TOML configuration and the resolved server context, including the dialect floor |
 | `limits.go` | every bound on a client-controllable resource |
-| `introspect.go` | the published capability facts: dialects, ciphers, per-config capabilities, live stats |
+| `introspect.go` | the published facts: the dialect table and floor, ciphers, per-config capabilities, live stats |
 | `netinfo.go` | interface enumeration for multichannel |
 | `status.go`, `log.go` | NTSTATUS codes and logging |
 | `cmd/` | the command-line entry point |
@@ -204,9 +228,17 @@ NTLMv2 with a local user database, optional guest access, SMB2/3 signing,
 SMB 3.1.1 preauth integrity, and SMB3 encryption (AES-128/256-GCM/CCM).
 **Authorization is share-level only** and all I/O runs as
 the server's Unix user. Symlinks inside a share are followed even outside it, as
-in Samba's `wide links`. No external security review has been done: do not
-expose 445 to the public internet. Details and the reporting process are in
-[SECURITY.md](SECURITY.md).
+in Samba's `wide links`.
+
+The dialect floor matters to the posture, so it is worth stating together with
+the rest: SMB 2.0.2 and 2.1 have **no encryption and no downgrade protection**,
+so `min_dialect = "3.0"` (or `encrypt = true`, which implies it) is the setting
+that removes both. `SECURITY.md` spells out the consequences.
+
+No external security review has been done. The goal is a server that is safe to
+expose, but that goal is the direction of travel and not a warranty: until a
+review happens, treat 445 as untrusted-network-facing only with signing and
+encryption on. Details and the reporting process are in [SECURITY.md](SECURITY.md).
 
 ## Not part of the codebase
 

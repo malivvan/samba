@@ -13,7 +13,7 @@ import (
 
 // TestDialectsMatchNegotiation pins the published dialect list to the one the
 // NEGOTIATE handler searches, including the order (both claim to be the server
-// preference).
+// preference), and pins the names `min_dialect` accepts to that same table.
 func TestDialectsMatchNegotiation(t *testing.T) {
 	got := Dialects()
 	if len(got) != len(supportedDialects) {
@@ -24,8 +24,51 @@ func TestDialectsMatchNegotiation(t *testing.T) {
 			t.Errorf("Dialects()[%d] = %#x, supportedDialects[%d] = %#x",
 				i, got[i].Revision, i, supportedDialects[i])
 		}
-		if got[i].Name == "" || got[i].Detail == "" {
-			t.Errorf("Dialects()[%d] (%#x) is missing its name or detail", i, got[i].Revision)
+		if got[i].Name == "" || got[i].Detail == "" || got[i].Version == "" {
+			t.Errorf("Dialects()[%d] (%#x) is missing its name, version or detail", i, got[i].Revision)
+		}
+		// The configuration spelling must resolve back to this dialect: it is
+		// what min_dialect takes and what the CLI prints.
+		if d, ok := DialectByName(got[i].Version); !ok || d.Revision != got[i].Revision {
+			t.Errorf("DialectByName(%q) = %+v, %t", got[i].Version, d, ok)
+		}
+	}
+
+	// DialectNames is the same set, oldest first, so an error message reads in
+	// the order a user would expect.
+	names := DialectNames()
+	if len(names) != len(got) {
+		t.Fatalf("DialectNames() has %d entries, want %d", len(names), len(got))
+	}
+	for i, n := range names {
+		if want := got[len(got)-1-i].Version; n != want {
+			t.Errorf("DialectNames()[%d] = %q, want %q", i, n, want)
+		}
+	}
+
+	// Anything that is not exactly a version spelling must not resolve, so a
+	// typo in min_dialect fails instead of silently taking a default.
+	for _, bad := range []string{"", "2.0", "4.0", "SMB 3.0", "3.0 ", "3.1.1.1"} {
+		if d, ok := DialectByName(bad); ok {
+			t.Errorf("DialectByName(%q) must not resolve, got %+v", bad, d)
+		}
+	}
+
+	// The two floors name real dialects, and the encryption floor is newer than
+	// the default one.
+	def := dialectFloorOrPanic(DefaultMinDialect)
+	enc := dialectFloorOrPanic(EncryptionMinDialect)
+	if enc.Revision <= def.Revision {
+		t.Fatalf("the encryption floor %s must be newer than the default floor %s", enc.Version, def.Version)
+	}
+	if enc.Revision != 0x0300 {
+		t.Errorf("the encryption floor is %#x, want SMB 3.0 (0x0300)", enc.Revision)
+	}
+	// And the invariant `encrypt = true` rests on: everything below the
+	// encryption floor is a dialect that has no encryption at all.
+	for _, d := range got {
+		if d.Revision < enc.Revision && d.Revision >= 0x0300 {
+			t.Errorf("%s (%#x) sits below the encryption floor and must be a 2.x dialect", d.Version, d.Revision)
 		}
 	}
 }

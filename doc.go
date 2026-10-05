@@ -2,12 +2,29 @@
 //
 // It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 authentication, SMB2/3 signing,
 // SMB 3.1.1 preauth integrity, SMB3 multichannel, and SMB3 encryption
-// (AES-128/256-GCM and AES-128/256-CCM). It supports a user database, optional
-// guest access, byte-range locks, leases (read-caching and handle-caching), and
+// (AES-128/256-GCM and AES-128/256-CCM, negotiated from 3.1.1 and fixed at
+// AES-128-CCM in 3.0/3.0.2). It supports a user database, optional guest
+// access, byte-range locks, leases (read-caching and handle-caching), and
 // directory change notification.
 //
 // The package is written entirely in pure Go: no CGO and no unsafe, so it is
 // statically linkable and memory safe.
+//
+// # Security goal
+//
+// The goal is a file server that can be exposed to the public internet without
+// putting the host at risk, and the defaults and scope follow from that: every
+// client-controllable resource is bounded, every wire parse is bounds-checked,
+// and a weakness that exists only for compatibility is refused rather than
+// tolerated. Two decisions in particular are deliberate and permanent — SMB1 is
+// not supported and will not be, and Kerberos was removed rather than shipped
+// with the RC4-HMAC fallback (see AGENTS.md) — and two settings are guarantees
+// rather than hints: `min_dialect` refuses a weaker dialect instead of
+// downgrading to it, and `encrypt = true` refuses any session the server cannot
+// encrypt instead of serving it in the clear.
+//
+// No external security review has been done yet; SECURITY.md and ROADMAP.md are
+// explicit about what that does and does not imply.
 //
 // # Architecture
 //

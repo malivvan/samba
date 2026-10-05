@@ -15,6 +15,26 @@ Large unsigned file reads never copy through userspace: the response header is
 written and the kernel then moves the file's page-cache pages straight into the
 socket through splice(2).
 
+## What this is for
+
+The goal is a file server you can **expose to the public internet** without
+putting the host at risk. That shapes the defaults: compatibility is never a
+reason to accept a weakness, every client-controllable resource is bounded, and
+a security setting is a guarantee rather than a hint. Two consequences worth
+knowing up front:
+
+- **SMB1 is not supported, and never will be.** Its useful surface is a
+  catalogue of historical vulnerabilities, and every client that matters has
+  spoken SMB2/3 for years. An SMB1-only client gets the SMB2 wildcard response
+  and times out rather than being served.
+- **SMB 2.x has no encryption and no downgrade protection.** `min_dialect =
+  "3.0"` drops it entirely, and `encrypt = true` implies that floor — a client
+  that cannot encrypt is refused, never served in the clear. See
+  [SECURITY.md](SECURITY.md).
+
+No external security review has been done yet: that is the direction of travel,
+not a warranty.
+
 > ### NTLMv2 only: Kerberos was removed
 >
 > This server authenticates with **NTLMv2, and nothing else**. Kerberos support
@@ -185,6 +205,7 @@ and `--check` can never disagree about what a configuration means.
 | `multichannel` | `false` | Advertise SMB3 multichannel and accept session binding. |
 | `advertise_only` | `[]` | Addresses to advertise for multichannel; empty = every non-loopback interface. |
 | `oplocks` | `true` | Grant leases: read-caching and handle-caching (R/RH). Write-caching is never granted. |
+| `min_dialect` | `"2.0.2"`, or `"3.0"` when `encrypt = true` | Oldest dialect to negotiate (`"2.0.2"`, `"2.1"`, `"3.0"`, `"3.0.2"`, `"3.1.1"`). A client offering nothing at or above it is refused, not downgraded. |
 | `max_connections` | `512` | Concurrent connections the server will serve. The main lever on worst-case memory use; `-1` removes the limit. |
 | `[[share]]` | at least one required | `name`, `path` (must be an existing directory), `read_only` (default false). `IPC$` is reserved. |
 | `[[user]]` | none | `name` plus exactly one of `password` or `nt_hash` (32 hex chars), checked by NTLMv2. There is no directory service behind it. |
@@ -193,6 +214,7 @@ and `--check` can never disagree about what a configuration means.
 listen = "0.0.0.0:445"
 workers = 0
 require_signing = true
+min_dialect = "3.0"
 multichannel = true
 
 [[share]]
@@ -204,7 +226,9 @@ name = "alice"
 password = "secret"        # or: nt_hash = "<32 hex chars>"
 ```
 
-Run it with `samba --config /etc/samba/samba.toml`.
+Run it with `samba --config /etc/samba/samba.toml`. For an internet-facing
+deployment add `encrypt = true` and `allow_guest = false`; `encrypt` also raises
+the dialect floor to 3.0 on its own.
 
 ### Resource limits
 

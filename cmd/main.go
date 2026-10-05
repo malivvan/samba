@@ -259,6 +259,7 @@ func describe(cfg *samba.Config, srv *samba.Server, workers int) []string {
 		line("server_name", cfg.ServerName),
 		line("max_read", strconv.Itoa(int(samba.MaxReadTarget)/1024)+" KiB"),
 		line("max_connections", conns),
+		line("min_dialect", dialectFloorText(cfg)),
 		line("log_level", logLevelName(cfg.LogLevel)),
 		line("allow_guest", strconv.FormatBool(cfg.GuestAllowed())),
 		line("require_signing", strconv.FormatBool(cfg.RequireSigning)),
@@ -414,6 +415,9 @@ func printConfig(w io.Writer, cfg *samba.Config) {
 	if cfg.MaxConnections != nil {
 		fmt.Fprintf(w, "max_connections = %d\n", *cfg.MaxConnections)
 	}
+	if cfg.MinDialect != "" {
+		fmt.Fprintf(w, "min_dialect = %q\n", cfg.MinDialect)
+	}
 	if len(cfg.AdvertiseOnly) > 0 {
 		fmt.Fprintf(w, "advertise_only = [%s]\n", quoteList(cfg.AdvertiseOnly))
 	}
@@ -429,6 +433,20 @@ func printConfig(w io.Writer, cfg *samba.Config) {
 		if u.NTHash != "" {
 			fmt.Fprintf(w, "nt_hash = %q\n", "<redacted>")
 		}
+	}
+}
+
+// dialectFloorText renders the effective dialect floor: what `min_dialect`
+// resolved to, saying where it came from when it was not set explicitly.
+func dialectFloorText(cfg *samba.Config) string {
+	floor := cfg.DialectFloor().Version
+	switch {
+	case cfg.MinDialect == floor:
+		return floor
+	case floor == samba.DefaultMinDialect:
+		return floor + " (default)"
+	default:
+		return floor + " (required by encrypt = true)"
 	}
 }
 

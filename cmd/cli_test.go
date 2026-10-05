@@ -269,3 +269,57 @@ func TestDescribeMatchesCapabilities(t *testing.T) {
 		}
 	}
 }
+
+// TestCheckReportsDialectFloor checks that --check shows the floor that is
+// actually enforced, including the one `encrypt` implies, so an operator can see
+// the difference between what they wrote and what the server will do.
+func TestCheckReportsDialectFloor(t *testing.T) {
+	path := writeConfig(t, "min_dialect = \"3.1.1\"\n")
+	code, out, errOut := runCLI(t, "--check", "--config", path)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut)
+	}
+	if got := field(t, out, "min_dialect"); got != "3.1.1" {
+		t.Errorf("min_dialect = %q, want 3.1.1", got)
+	}
+
+	// Left unset, the floor is the default, and the report says so.
+	path = writeConfig(t, "")
+	code, out, errOut = runCLI(t, "--check", "--config", path)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut)
+	}
+	if got := field(t, out, "min_dialect"); !strings.HasPrefix(got, samba.DefaultMinDialect) {
+		t.Errorf("min_dialect = %q, want the default %s", got, samba.DefaultMinDialect)
+	}
+
+	// With encryption required the floor is raised, and the report says why.
+	path = writeConfig(t, "encrypt = true\n")
+	code, out, errOut = runCLI(t, "--check", "--config", path)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut)
+	}
+	if got := field(t, out, "min_dialect"); !strings.Contains(got, samba.EncryptionMinDialect) || !strings.Contains(got, "encrypt") {
+		t.Errorf("min_dialect = %q, want the floor raised by encrypt and the reason", got)
+	}
+}
+
+// TestDumpConfigPrintsMinDialect checks that a set floor survives the round trip
+// through the dump, which is meant to be a usable config.
+func TestDumpConfigPrintsMinDialect(t *testing.T) {
+	path := writeConfig(t, "min_dialect = \"3.0\"\n")
+	code, out, errOut := runCLI(t, "--dump-config", "--config", path)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut)
+	}
+	if !strings.Contains(out, `min_dialect = "3.0"`) {
+		t.Errorf("--dump-config omits min_dialect:\n%s", out)
+	}
+
+	// And that a config still carrying the removed settings is refused rather
+	// than quietly losing its floor.
+	old := writeConfig(t, "min_dialect = \"2.1\"\nencrypt = true\n")
+	if code, _, errOut := runCLI(t, "--dump-config", "--config", old); code != 2 {
+		t.Fatalf("encrypt with a 2.x floor: exit = %d, want 2 (stderr %q)", code, errOut)
+	}
+}

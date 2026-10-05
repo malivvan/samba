@@ -6,6 +6,42 @@ conventional commits.
 
 ## [Unreleased]
 
+### Dialect floor, and a real encryption guarantee
+
+- **`encrypt = true` was silently unenforced for every dialect below 3.1.1, and
+  this was a real bug.** A cipher was only ever chosen for 3.1.1, so a client
+  offering 2.0.2, 2.1, **3.0 or 3.0.2** would negotiate, authenticate and then
+  exchange **cleartext** on a server that required encryption — an attacker only
+  had to offer 3.0.2 to strip it. Verified by negotiation before the fix:
+  `SessionFlags 0x0` and a plaintext `ECHO` answered `0x0`. Three changes close
+  it:
+  - SMB 3.0 and 3.0.2 encryption is implemented (`smb3EncryptionKeys`: label
+    `SMB2AESCCM`, contexts `ServerIn ` / `ServerOut`, cipher fixed at
+    AES-128-CCM), pinned by vectors computed independently from MS-SMB2 3.1.4.2.
+  - Session establishment refuses any session it cannot encrypt, so the setting
+    cannot be evaded with an unusual capability set.
+  - `SMB2_GLOBAL_CAP_ENCRYPTION` is now echoed to a 3.0/3.0.2 client that asks
+    for it, which is what a client-requested (`seal`) mount needs there.
+- **`min_dialect`** is new: the oldest dialect to negotiate (`"2.0.2"` through
+  `"3.1.1"`). A client offering nothing at or above the floor is refused with
+  `STATUS_NOT_SUPPORTED` rather than downgraded, which is what makes it a
+  guarantee. It lives in `introspect.go` (the dialect table, its configuration
+  spellings and the floor constants) and `config.go` (the key, its validation and
+  `Config.DialectFloor`), with `TestDialectsMatchNegotiation` extended to pin the
+  spellings to the table NEGOTIATE actually searches.
+- **`encrypt = true` and `min_dialect` are now consistent by construction**: the
+  first raises the floor to SMB 3.0, and a configuration that pairs it with an
+  explicit 2.x `min_dialect` is **rejected at startup** rather than quietly
+  resolved, so an operator's explicit setting is never silently overridden.
+- **The internet-safety goal is stated explicitly**, in `AGENTS.md`, `README.md`,
+  `doc.go` and `SECURITY.md`, and **SMB1 is recorded as never going to be
+  implemented**. `SECURITY.md` now spells out what the 2.x dialects cost: no
+  encryption, and no downgrade protection.
+- `ROADMAP.md` was reordered by priority, grouped by topic, and each remaining
+  item now states the consequence of not doing it; the items settled by the last
+  few changes (Kerberos, SMB1, non-Linux, CGO) moved into a single decisions
+  section instead of sitting in the TODO lists.
+
 ### Kerberos removed
 
 - **Kerberos is gone, and so is its dependency.** NTLMv2 is now the only

@@ -16,6 +16,9 @@ import "fmt"
 type Dialect struct {
 	// Name is the marketing name, e.g. "SMB 3.1.1".
 	Name string
+	// Version is the spelling the configuration uses, e.g. "3.1.1". This is
+	// what `min_dialect` takes, and what the CLI prints for it.
+	Version string
 	// Revision is the revision code as it appears on the wire.
 	Revision uint16
 	// Detail is what that dialect adds, in one line.
@@ -26,11 +29,54 @@ type Dialect struct {
 // must match the list the NEGOTIATE handler searches (supportedDialects);
 // TestDialectsMatchNegotiation pins the two together.
 var dialects = []Dialect{
-	{"SMB 3.1.1", 0x0311, "pre-authentication integrity, AES-128-GCM, negotiate contexts"},
-	{"SMB 3.0.2", 0x0302, "RDMA transport revisions"},
-	{"SMB 3.0", 0x0300, "encryption, multichannel, secure negotiate"},
-	{"SMB 2.1", 0x0210, "leases, multi-credit, resilient handles"},
-	{"SMB 2.0.2", 0x0202, "durable handles, handle-based operations"},
+	{"SMB 3.1.1", "3.1.1", 0x0311, "pre-authentication integrity, negotiated ciphers, negotiate contexts"},
+	{"SMB 3.0.2", "3.0.2", 0x0302, "RDMA transport revisions, AES-128-GCM"},
+	{"SMB 3.0", "3.0", 0x0300, "encryption (AES-128-CCM), multichannel, secure negotiate"},
+	{"SMB 2.1", "2.1", 0x0210, "leases, multi-credit, resilient handles; no encryption"},
+	{"SMB 2.0.2", "2.0.2", 0x0202, "durable handles, handle-based operations; no encryption"},
+}
+
+// DialectByName resolves a configuration spelling ("2.0.2", "3.0", "3.1.1") to
+// the dialect it names.
+func DialectByName(version string) (Dialect, bool) {
+	for _, d := range dialects {
+		if d.Version == version {
+			return d, true
+		}
+	}
+	return Dialect{}, false
+}
+
+// DialectNames lists the configuration spellings, oldest first — the accepted
+// values of `min_dialect`, in the order an error message should show them.
+func DialectNames() []string {
+	out := make([]string, 0, len(dialects))
+	for i := len(dialects) - 1; i >= 0; i-- {
+		out = append(out, dialects[i].Version)
+	}
+	return out
+}
+
+const (
+	// DefaultMinDialect is the dialect floor when `min_dialect` is unset: every
+	// dialect the server implements.
+	DefaultMinDialect = "2.0.2"
+	// EncryptionMinDialect is the oldest dialect that can encrypt at all, and so
+	// the floor whenever `encrypt` is set. SMB 2.0.2 and 2.1 have no encryption
+	// and no way to add it, so a "require encryption" server that still
+	// negotiated them would serve those clients in the clear.
+	EncryptionMinDialect = "3.0"
+)
+
+// dialectFloorOrPanic resolves one of the constants above. Both are in the
+// table by construction and TestDialectsMatchNegotiation says so, which makes a
+// miss a programming error rather than a runtime condition.
+func dialectFloorOrPanic(version string) Dialect {
+	d, ok := DialectByName(version)
+	if !ok {
+		panic("samba: dialect " + version + " is missing from the dialect table")
+	}
+	return d
 }
 
 // Dialects lists the dialects the server negotiates, newest first, in the order
@@ -126,7 +172,7 @@ func (s *Srv) Capabilities() []Capability {
 	}
 
 	return []Capability{
-		{Name: "dialects", Detail: "SMB 2.0.2 through 3.1.1", Enabled: true},
+		{Name: "dialects", Detail: "SMB " + cfg.DialectFloor().Version + " through " + dialects[0].Version, Enabled: true},
 		{Name: "ntlmv2", Detail: "local user database; the only mechanism", Enabled: true},
 		{Name: "guest", Detail: "unauthenticated sessions", Enabled: s.allowGuest},
 		{Name: "signing", Detail: signing, Enabled: true},

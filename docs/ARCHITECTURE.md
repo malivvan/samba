@@ -161,10 +161,16 @@ or synchronization. The transport only knows about framing and the
   response is not separately signed — the AEAD tag is the integrity.
 - **Credits**: each request's charge is consumed and the grant is
   `clamp(requested, 1, 512 − outstanding)`, a 512-credit window per connection.
-- **Dialects** 2.0.2, 2.1, 3.0, 3.0.2 and 3.1.1, the last with SHA-512 preauth
-  integrity and the preauth/encryption negotiate contexts. An SMB1 NEGOTIATE
-  gets the 0x02FF wildcard response whatever dialects it offers; an SMB1-only
-  client cannot parse that and times out instead of being refused.
+- **Dialects** 2.0.2, 2.1, 3.0, 3.0.2 and 3.1.1. 3.1.1 negotiates its cipher in
+  a negotiate context and carries SHA-512 preauth integrity; 3.0 and 3.0.2 have
+  no cipher context and use AES-128-CCM, with the keys derived without a preauth
+  hash (`channelEncryption` picks the right family, so session establishment and
+  channel binding cannot disagree). The server takes the newest dialect the
+  client offers that is at or above `min_dialect` — which `encrypt = true` raises
+  to 3.0, because 2.x has no encryption — and refuses a client below the floor
+  rather than downgrading to it. An SMB1 NEGOTIATE gets the 0x02FF wildcard
+  response whatever dialects it offers; an SMB1-only client cannot parse that and
+  times out instead of being refused.
 
 ## VFS layer
 

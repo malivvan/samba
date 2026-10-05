@@ -361,3 +361,60 @@ func TestConfigRejectsRemovedAuthKeys(t *testing.T) {
 		}
 	}
 }
+
+// TestConfigMinDialectAndFloor covers min_dialect, the floor it resolves to, and
+// the combination that must not be allowed: requiring encryption while admitting
+// a dialect that cannot encrypt.
+func TestConfigMinDialectAndFloor(t *testing.T) {
+	dir := t.TempDir()
+	share := "[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n"
+
+	parse := func(t *testing.T, raw string) *Config {
+		t.Helper()
+		cfg, err := ParseConfig([]byte(raw + share))
+		if err != nil {
+			t.Fatalf("ParseConfig(%q): %v", raw, err)
+		}
+		return cfg
+	}
+
+	// Unset: every dialect the server implements.
+	if got := parse(t, "").DialectFloor().Version; got != DefaultMinDialect {
+		t.Errorf("default floor = %q, want %q", got, DefaultMinDialect)
+	}
+	// Set explicitly, at either end of the table.
+	for _, v := range []string{"2.0.2", "3.0", "3.1.1"} {
+		if got := parse(t, "min_dialect = \""+v+"\"\n").DialectFloor().Version; got != v {
+			t.Errorf("floor = %q, want %q", got, v)
+		}
+	}
+	// encrypt raises the floor when min_dialect is left out, because 2.x cannot
+	// encrypt at all.
+	if got := parse(t, "encrypt = true\n").DialectFloor().Version; got != EncryptionMinDialect {
+		t.Errorf("floor with encrypt = true = %q, want %q", got, EncryptionMinDialect)
+	}
+	// An explicit 3.x floor with encrypt is consistent and stays as given.
+	if got := parse(t, "encrypt = true\nmin_dialect = \"3.1.1\"\n").DialectFloor().Version; got != "3.1.1" {
+		t.Errorf("floor = %q, want 3.1.1", got)
+	}
+
+	// An unknown dialect is a typo, not a floor.
+	for _, bad := range []string{"2.0", "4.0", "SMB 3.0", "smb3"} {
+		if _, err := ParseConfig([]byte("min_dialect = \"" + bad + "\"\n" + share)); err == nil {
+			t.Errorf("min_dialect = %q must be rejected", bad)
+		}
+	}
+
+	// Requiring encryption while admitting 2.x is a contradiction: the server
+	// would negotiate those clients and then serve them in the clear.
+	for _, old := range []string{"2.0.2", "2.1"} {
+		_, err := ParseConfig([]byte("encrypt = true\nmin_dialect = \"" + old + "\"\n" + share))
+		if err == nil {
+			t.Errorf("encrypt = true with min_dialect = %q must be rejected", old)
+			continue
+		}
+		if !strings.Contains(err.Error(), "no encryption") {
+			t.Errorf("the error should explain the encryption problem, got %v", err)
+		}
+	}
+}

@@ -40,6 +40,13 @@ log_level = 1
 # served unsigned.
 require_signing = true
 
+# The oldest SMB dialect to negotiate. A client that offers nothing at or above
+# this is refused, not downgraded to something older. This is the setting that
+# removes the two weaknesses of SMB 2.x — it has no encryption and no downgrade
+# protection — so raise it to "3.0" (or higher) unless you really need 2.x
+# clients. Values: "2.0.2", "2.1", "3.0", "3.0.2", "3.1.1".
+min_dialect = "3.0"
+
 # Require SMB3 encryption (AES-128/256-GCM/CCM) for all post-authentication
 # traffic. When false, encryption a client asks for (e.g. cifs `seal`) is still
 # honored if a cipher is negotiated.

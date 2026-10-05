@@ -302,6 +302,38 @@ func TestEncKeysDeterministicAndDistinct(t *testing.T) {
 	}
 }
 
+// TestSMB3EncryptionKeysMatchSpec pins the SMB 3.0/3.0.2 key derivation against
+// vectors computed independently from MS-SMB2 3.1.4.2 (and matching what the
+// Linux client and ksmbd derive). The labels and contexts carry their
+// terminating NUL, and the "ServerIn " context carries a trailing space, which
+// no round-trip test against our own code can catch: a transposed byte here
+// produces keys that are self-consistent and silently never interoperate.
+func TestSMB3EncryptionKeysMatchSpec(t *testing.T) {
+	var sk [16]byte
+	for i := range sk {
+		sk[i] = byte(i)
+	}
+	c2s, s2c := smb3EncryptionKeys(&sk)
+	const (
+		wantC2S = "8e21f3cae16d07d84c03d74467f57878" // KDF(sk, "SMB2AESCCM\0", "ServerIn \0")
+		wantS2C = "95d8b55c852cd25349994b3842fa4105" // KDF(sk, "SMB2AESCCM\0", "ServerOut\0")
+	)
+	if got := hex.EncodeToString(c2s[:16]); got != wantC2S {
+		t.Errorf("client→server key = %s, want %s", got, wantC2S)
+	}
+	if got := hex.EncodeToString(s2c[:16]); got != wantS2C {
+		t.Errorf("server→client key = %s, want %s", got, wantS2C)
+	}
+	if c2s == s2c {
+		t.Fatal("the two directions must differ: a swapped pair encrypts with the peer's key")
+	}
+	// AES-128: the 32-byte buffers are only half filled.
+	var zeroTail [16]byte
+	if !bytes.Equal(c2s[16:], zeroTail[:]) {
+		t.Error("the AES-128 key must leave the tail zeroed")
+	}
+}
+
 func TestKDF128Structure(t *testing.T) {
 	// Pin the exact SP800-108 message layout against a manual HMAC.
 	key := [16]byte{7}
