@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet ./...
+      - name: Build (static, no CGO)
+        run: CGO_ENABLED=0 go build -trimpath ./...
+      - name: No CGO, no unsafe
+        run: |
+          set -e
+          # A change that reaches for a C library or unsafe must be re-thought,
+          # not exempted: this package is pure Go by design.
+          if grep -rn --include='*.go' -E 'import +"C"|import +"unsafe"|"unsafe"' . \
+              | grep -v '_test.go' | grep -v '^./docs/' ; then
+            echo "::error::CGO or unsafe usage found in a shipping file"
+            exit 1
+          fi
+      - name: Test
+        run: go test ./...
+      - name: Test under the race detector
+        run: go test -race ./...
+      - name: Fuzz smoke (10s per target)
+        run: |
+          set -e
+          for t in FuzzProcessFrame FuzzNTLM FuzzClassifyBlob FuzzParseLeaseCtx; do
+            go test -run '^$' -fuzz "^${t}$" -fuzztime 10s .
+          done
+
+  cross-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # The package is Linux-only by design (SO_REUSEPORT, inotify, splice), so
+      # this only proves the protocol layer still compiles for other arches.
+      - name: Cross-build (arm64)
+        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...

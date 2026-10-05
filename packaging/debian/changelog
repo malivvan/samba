@@ -1,0 +1,7 @@
+samba (1.4.0-1) unstable; urgency=medium
+
+  * Initial release: pure-Go SMB2/SMB3 file server at the 1.4 feature level
+    (SMB 2.0.2-3.1.1, NTLMv2 + Kerberos, signing, preauth integrity, SMB3
+    multichannel, SMB3 encryption AES-128/256-GCM/CCM, leases, change notify).
+
+ -- malivvan <malivvan@users.noreply.github.com>  Mon, 05 Oct 2026 00:00:00 +0000

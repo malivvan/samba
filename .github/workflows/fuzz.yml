@@ -1,0 +1,32 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 3 * * 0"  # weekly, Sunday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzProcessFrame, FuzzNTLM, FuzzClassifyBlob, FuzzParseLeaseCtx]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Fuzz ${{ matrix.target }} (90s smoke)
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 90s .
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: testdata/fuzz/${{ matrix.target }}/

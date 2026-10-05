@@ -1,0 +1,4 @@
+# The binary is static and links nothing, so there are no library dependencies
+# to flag; it needs only a modern kernel.
+addFilter("no-documentation")
+addFilter("statically-linked-binary")

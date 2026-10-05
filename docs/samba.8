@@ -1,0 +1,157 @@
+.TH SAMBA 8 "2026-10-05" "samba" "System Administration"
+.SH NAME
+samba \- pure-Go SMB2/SMB3 file server (zero-copy reads, multichannel)
+.SH SYNOPSIS
+.B samba
+[\fB\-\-config\fR \fIpath\fR]
+[\fB\-\-check\fR]
+[\fB\-\-version\fR]
+.SH DESCRIPTION
+.B samba
+is a from-scratch SMB2/3 file server, an
+.BR smbd (8)
+replacement, written entirely in Go: no CGO, no \f(CWunsafe\fR. It listens on
+TCP 445 only (direct TCP; there is no NetBIOS port 139, no RPC, and no
+management API), and it serves every worker from its own
+.BR SO_REUSEPORT
+listener so the kernel spreads connections across CPU cores.
+.PP
+It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 and Kerberos (GSS-API/SPNEGO)
+authentication, SMB2/3 signing, SMB 3.1.1 preauth integrity, SMB3 multichannel,
+SMB3 encryption (AES-128/256-GCM and AES-128/256-CCM), byte-range locks,
+directory change notification, and read- and handle-caching leases.
+.PP
+Large unsigned reads never copy the file's data through userspace: the response
+header is written and the kernel moves page-cache pages straight into the socket
+with
+.BR splice (2).
+Reads that must be signed or encrypted, and reads inside a compound request,
+take a buffered positional-read path instead.
+.SH OPTIONS
+.TP
+.BR \-\-config " " \fIpath\fR " (or " \-c ")"
+Path to the TOML configuration file. Default: \fIsamba.toml\fR.
+.TP
+.B \-\-check
+Validate the configuration and exit.
+.TP
+.BR \-\-version " (or " \-V ")"
+Print the version and exit.
+.SH CONFIGURATION
+Configuration is TOML, by convention \fI/etc/samba/samba.toml\fR. Unknown keys
+are rejected. See
+.I samba.toml.example
+for a fully commented file.
+.TP
+.B listen
+Bind address, default \fB"0.0.0.0:445"\fR. Binding 445 needs
+CAP_NET_BIND_SERVICE or root.
+.TP
+.B workers
+Listener goroutines, each with its own SO_REUSEPORT listener. 0 = one per CPU
+core.
+.TP
+.B server_name
+Advertised server name; also the default Kerberos SPN host (\fIcifs/<name>\fR).
+.TP
+.B log_level
+0 = warn, 1 = info, 2 = debug.
+.TP
+.B allow_guest
+Allow unauthenticated guest sessions. Defaults to true only when no
+\fB[[user]]\fR entries exist.
+.TP
+.B require_signing
+Reject unsigned requests on authenticated sessions.
+.TP
+.B encrypt
+Require SMB3 encryption on all post-authentication traffic. Default false;
+encryption a client asks for (e.g. cifs \fBseal\fR) is honored either way.
+.TP
+.B prefer_aes256
+Prefer AES-256 (GCM, then CCM) when the client offers it, instead of honoring
+the client's preference order.
+.TP
+.B multichannel
+Advertise SMB3 multichannel and accept session binding.
+.TP
+.B advertise_only
+Addresses to advertise for multichannel (e.g. a dedicated storage NIC). Empty =
+every non-loopback interface.
+.TP
+.B oplocks
+Grant leases: read-caching, plus handle-caching when the client asks. Default
+true. Write-caching is never granted.
+.TP
+.B auth
+\fB"ntlm"\fR, \fB"kerberos"\fR or \fB"both"\fR (the default; Kerberos is
+preferred with NTLM as fallback).
+.TP
+.B [kerberos]
+\fBenabled\fR (default true), \fBkeytab\fR (default
+\fI$KRB5_KTNAME\fR, then \fI/etc/krb5.keytab\fR), \fBspn\fR (default
+\fIcifs/<server_name>\fR) and \fBrealm\fR (parsed; the realm actually comes from
+the ticket).
+.TP
+.B [[share]]
+At least one is required: \fBname\fR, \fBpath\fR (an existing directory) and
+\fBread_only\fR (default false). The name \fIIPC$\fR is reserved.
+.TP
+.B [[user]]
+\fBname\fR plus exactly one of \fBpassword\fR or \fBnt_hash\fR (32 hex
+characters). NTLM users only; Kerberos principals come from the KDC.
+.SH FILES
+.TP
+.I /etc/samba/samba.toml
+Conventional configuration path.
+.TP
+.I samba.toml
+Default when \fB\-\-config\fR is not given.
+.SH EXAMPLES
+.PP
+.nf
+# /etc/samba/samba.toml
+listen = "0.0.0.0:445"
+require_signing = true
+multichannel = true
+
+[[share]]
+name = "data"
+path = "/srv/data"
+
+[[user]]
+name = "alice"
+password = "secret"
+.fi
+.PP
+Run it:
+.PP
+.nf
+samba --config /etc/samba/samba.toml
+.fi
+.PP
+Mount it from a client:
+.PP
+.nf
+mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,sec=ntlmsspi
+mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,seal
+mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,multichannel,max_channels=4
+.fi
+.SH EXIT STATUS
+.TP
+.B 0
+Clean shutdown.
+.TP
+.B 2
+A usage error, a configuration error, or a startup failure.
+.SH SECURITY
+Authorization is \fBshare-level only\fR: \fBread_only\fR applies to every user,
+and all file I/O runs as the server's Unix user. Run the server as a dedicated
+unprivileged user that owns only the share trees. No external security review has
+been done; do not expose port 445 to the public internet. See
+.I SECURITY.md.
+.SH SEE ALSO
+.BR smbd (8),
+.BR mount.cifs (8),
+.BR docs/ARCHITECTURE.md ,
+.BR docs/TUNING.md

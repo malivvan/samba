@@ -1,0 +1,11 @@
+# Build output
+/samba
+/out/
+*.test
+
+# Editor / tooling scratch
+*.swp
+.DS_Store
+
+# Go fuzzing finds its way in here only when it has a crasher to keep, and
+# those are meant to be committed — so nothing to ignore for testdata/fuzz/.

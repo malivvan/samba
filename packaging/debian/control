@@ -1,0 +1,28 @@
+Source: samba
+Section: net
+Priority: optional
+Maintainer: malivvan <malivvan@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ golang-go (>= 2:1.27~)
+Standards-Version: 4.7.2
+Homepage: https://github.com/malivvan/samba
+Vcs-Git: https://github.com/malivvan/samba.git
+Vcs-Browser: https://github.com/malivvan/samba
+Rules-Requires-Root: no
+
+Package: samba
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: pure-Go SMB2/SMB3 file server (zero-copy reads, multichannel)
+ A from-scratch SMB2/SMB3 file server written entirely in Go: no CGO, no
+ unsafe. It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 and Kerberos
+ authentication, SMB2/3 signing, SMB 3.1.1 preauth integrity, SMB3
+ multichannel, and SMB3 encryption (AES-128/256-GCM and -CCM), plus
+ byte-range locks, leases, and directory change notification.
+ .
+ Large unsigned reads move file pages to the socket through splice(2) without
+ ever entering userspace.
+ .
+ Requires a Linux kernel with SO_REUSEPORT, inotify and splice (any supported
+ kernel) and the capability to bind port 445.

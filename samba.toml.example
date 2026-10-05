@@ -1,0 +1,82 @@
+# samba.toml — example configuration.
+#
+# Every key is optional except at least one [[share]]. Unknown keys are
+# rejected, so a typo fails at startup instead of silently taking a default.
+# Validate a file without starting the server with: samba --check --config FILE
+
+# Bind address (ip:port). TCP 445 is the only transport: there is no NetBIOS
+# port 139, no RPC, no management API and no SMB Direct (RDMA).
+listen = "0.0.0.0:445"
+
+# Worker goroutines, each with its own SO_REUSEPORT listener. 0 = one per CPU
+# core. SO_REUSEPORT lets the kernel spread connections across them.
+workers = 0
+
+# Advertised server name. Also the default Kerberos SPN host (cifs/<name>).
+server_name = "SAMBA"
+
+# 0 = warn, 1 = info, 2 = debug.
+log_level = 1
+
+# Allow unauthenticated guest sessions. Defaults to true when no [[user]]
+# entries exist, false otherwise.
+# allow_guest = false
+
+# Reject unsigned requests on authenticated sessions.
+require_signing = true
+
+# Require SMB3 encryption (AES-128/256-GCM/CCM) for all post-authentication
+# traffic. When false, encryption a client asks for (e.g. cifs `seal`) is still
+# honored if a cipher is negotiated.
+# encrypt = false
+
+# Prefer AES-256 (GCM, then CCM) when the client offers it, instead of honoring
+# the client's preference order (which usually picks AES-128-GCM for speed).
+# prefer_aes256 = false
+
+# Advertise SMB3 multichannel and accept session binding, so a single client
+# mount can stripe I/O across several connections (and CPU cores).
+# multichannel = false
+
+# Restrict multichannel interface advertisement to these addresses (e.g. a
+# dedicated storage NIC). Empty = every non-loopback interface.
+# advertise_only = ["10.99.0.10"]
+
+# Grant leases: read-caching, plus handle-caching when the client asks for it.
+# Write-caching is never granted. Default on.
+oplocks = true
+
+# Authentication mechanisms: "ntlm", "kerberos" or "both" (Kerberos preferred,
+# NTLM fallback).
+# auth = "both"
+
+# Kerberos acceptor settings. Only consulted when `auth` permits Kerberos.
+# [kerberos]
+# enabled = true
+# keytab = "/etc/krb5.keytab"      # defaults to $KRB5_KTNAME, then the system keytab
+# spn = "cifs/fileserver.example.com"   # defaults to cifs/<server_name>
+# realm = "EXAMPLE.COM"            # the realm actually comes from the ticket
+
+# At least one share is required. `name` is the SMB share name, `path` must be
+# an existing directory. "IPC$" is reserved.
+[[share]]
+name = "data"
+path = "/srv/data"
+
+# read_only = true
+
+# Optional second share, restricted to read-only clients.
+# [[share]]
+# name = "public"
+# path = "/srv/public"
+# read_only = true
+
+# Optional user database. Set exactly one of `password` or `nt_hash` (32 hex
+# characters). NTLM users only; Kerberos principals come from the KDC.
+# [[user]]
+# name = "alice"
+# password = "secret"
+
+# [[user]]
+# name = "bob"
+# nt_hash = "8846f7eaee8fb117ad06bdd830b7586c"
