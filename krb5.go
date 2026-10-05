@@ -63,7 +63,6 @@ type krbEstablished struct {
 // krbStep is the result of one acceptor leg.
 type krbStep struct {
 	kind krbStepKind
-	out  []byte
 	est  *krbEstablished
 	err  string
 }

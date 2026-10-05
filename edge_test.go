@@ -206,10 +206,13 @@ func TestNTLMParserTruncations(t *testing.T) {
 	// A field claiming to extend past the token is refused.
 	bad := append([]byte{}, full...)
 	put16(bad[12+2:12+4], 0xFFFF) // NT response offset field (little-endian length is first)
-	if _, ok := parseAuthenticate(bad); ok {
-		// Either reading is acceptable as long as nothing panics and the response
-		// is internally consistent; the point is that it must not index out of
-		// range.
+	if auth, ok := parseAuthenticate(bad); ok {
+		// Either reading is acceptable — refuse the token, or return the part
+		// that is really there — as long as nothing panics and no length from
+		// the token is trusted: the response must be a slice of the input.
+		if len(auth.NTResponse) > len(bad) {
+			t.Fatalf("a %d-byte token cannot hold a %d-byte response", len(bad), len(auth.NTResponse))
+		}
 	}
 	// A blob with no NTLMSSP token at all.
 	if _, ok := parseAuthenticate([]byte("garbage")); ok {

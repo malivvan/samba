@@ -1,60 +1,172 @@
+# The one CI workflow: the unit/integration suite on all three desktop
+# platforms, the race detector, lint, coverage, fuzzing, the SMB client interop
+# suite, and the tagged release.
+#
+# A note on the test matrix. This server is Linux-only by design — the transport
+# and filesystem layer use SO_REUSEPORT, inotify, splice, OFD byte-range locks,
+# futimens and statfs through golang.org/x/sys/unix — so the macOS and Windows
+# legs do not build today. They still run on every push, because they are the
+# signal that would tell us the moment a portable path appears, but they are
+# `continue-on-error` and must never gate lint, coverage or the release. Linux
+# is the gate.
+
 name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
-    branches: [main]
+  schedule:
+    - cron: "0 3 * * 0" # weekly, Sunday 03:00 UTC: the long fuzz run
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  # A new push supersedes an older run of the same ref. Tag runs are never
+  # cancelled: a release must finish once it has started.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  build-test:
-    runs-on: ubuntu-latest
+  # Build, test and race-test the whole module — the package and cmd/samba —
+  # on each of the three desktop platforms.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    # See the header: the non-Linux legs are informational. Job-level
+    # continue-on-error also keeps them out of the `needs` result below, so a
+    # failing Windows or macOS leg cannot block the release.
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
       - name: Formatting
+        shell: bash
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - name: Vet
         run: go vet ./...
-      - name: Build (static, no CGO)
-        run: CGO_ENABLED=0 go build -trimpath ./...
-      - name: No CGO, no unsafe
-        run: |
-          set -e
-          # A change that reaches for a C library or unsafe must be re-thought,
-          # not exempted: this package is pure Go by design.
-          if grep -rn --include='*.go' -E 'import +"C"|import +"unsafe"|"unsafe"' . \
-              | grep -v '_test.go' | grep -v '^./docs/' ; then
-            echo "::error::CGO or unsafe usage found in a shipping file"
-            exit 1
-          fi
+      - name: Build (static, CGO disabled)
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+        run: go build -trimpath ./...
       - name: Test
         run: go test ./...
       - name: Test under the race detector
         run: go test -race ./...
-      - name: Fuzz smoke (10s per target)
-        run: |
-          set -e
-          for t in FuzzProcessFrame FuzzNTLM FuzzClassifyBlob FuzzParseLeaseCtx; do
-            go test -run '^$' -fuzz "^${t}$" -fuzztime 10s .
-          done
 
-  interop:
-    # Drive the built server with Samba's own client: the dialect matrix, file
-    # operations, authentication and SMB3 encryption. This is the closest thing
-    # to a real deployment that can run in CI, and it is where pipelining and
-    # encryption bugs were caught.
+  # golangci-lint (.golangci.yml) plus the source-level invariants that make the
+  # rest of the security posture meaningful.
+  lint:
+    name: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: go.mod
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          # Pinned: .golangci.yml is schema v2, and a lint gate that changes
+          # under you is not a gate. Bump this and the config together.
+          version: v2.14.0
+          args: --timeout=5m
+      - name: Pure Go only (no CGO, no unsafe)
+        shell: bash
+        run: |
+          set -eu
+          # A change that reaches for a C library or unsafe must be re-thought,
+          # not exempted: this package is pure Go by design.
+          if grep -rn --include='*.go' -E 'import +"C"|"unsafe"' . \
+              | grep -v '_test.go' | grep -v '^\./docs/'; then
+            echo "::error::CGO or unsafe usage found in a shipping file"
+            exit 1
+          fi
+
+  # Coverage is generated on every run and only *sent* on a push: a pull
+  # request from a fork has no access to the Coveralls secret.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Test with coverage
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+      - name: Total
+        run: go tool cover -func=coverage.out | tail -1
+      - name: Upload the profile
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+      - name: Send to Coveralls
+        if: github.event_name != 'pull_request'
+        uses: shogo82148/actions-goveralls@v1
+        with:
+          path-to-profile: coverage.out
+        env:
+          # actions-goveralls wraps mattn/goveralls, which reads the repository
+          # token from $COVERALLS_TOKEN. The secret is named after Coveralls'
+          # own convention (COVERALLS_REPO_TOKEN), so map it across. The
+          # official coverallsapp/github-action cannot be used here: it
+          # authenticates with the GitHub token and ignores the repo token.
+          COVERALLS_TOKEN: ${{ secrets.COVERALLS_REPO_TOKEN }}
+
+  # Every fuzz target, one job each, so a crasher names the target it came from.
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzProcessFrame, FuzzNTLM, FuzzClassifyBlob, FuzzParseLeaseCtx]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          # A push gets a smoke; the weekly scheduled run gets the long one.
+          FUZZTIME: ${{ github.event_name == 'schedule' && '15m' || '60s' }}
+        run: go test -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime "$FUZZTIME" .
+      - name: Upload the crashers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: testdata/fuzz/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+  # Drive the built server with Samba's own client: the dialect matrix, file
+  # operations, authentication and SMB3 encryption. This is the closest thing
+  # to a real deployment that can run in CI.
+  interop:
+    name: interop (smbclient)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
       - name: Install smbclient
         run: |
           sudo apt-get update
@@ -64,14 +176,107 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o ./samba ./cmd/samba
           ./bench/interop-smbclient.sh ./samba
 
-  cross-check:
+  cross-build:
+    name: cross-build (linux/arm64)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: stable
-      # The package is Linux-only by design (SO_REUSEPORT, inotify, splice), so
-      # this only proves the protocol layer still compiles for other arches.
-      - name: Cross-build (arm64)
-        run: GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...
+          go-version-file: go.mod
+      # The package is Linux-only by design, so this only proves the whole
+      # module still compiles for the other supported architecture.
+      - name: linux/arm64
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: go build -trimpath ./...
+
+  # A tag publishes a release, but only once lint, coverage, the tests (with the
+  # race detector) and the fuzzers have passed. `needs` makes that an implicit
+  # gate: if any of them fails or is skipped, this job is skipped too and no
+  # release is created.
+  release:
+    name: release ${{ github.ref_name }}
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, coverage, test, fuzz]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: The tag must match samba.Version
+        shell: bash
+        run: |
+          set -eu
+          declared="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' doc.go)"
+          if [ -z "$declared" ]; then
+            echo "::error::could not read Version from doc.go"
+            exit 1
+          fi
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$declared" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match samba.Version $declared (doc.go)"
+            exit 1
+          fi
+          echo "$GITHUB_REF_NAME matches samba.Version $declared"
+      - name: Build the static binaries
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p out
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "out/samba-linux-$arch" ./cmd/samba
+          done
+          # The binary is static: there are no library dependencies at all,
+          # which is the point of keeping the module CGO-free.
+          file out/samba-linux-amd64
+      - name: Smoke test the binary
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p /tmp/shares/data
+          cat > /tmp/samba.toml <<'INI'
+          listen = "127.0.0.1:8445"
+          [[share]]
+          name = "data"
+          path = "/tmp/shares/data"
+          INI
+          ./out/samba-linux-amd64 --version
+          ./out/samba-linux-amd64 --check --config /tmp/samba.toml
+      - name: Benchmarks
+        shell: bash
+        run: |
+          set -eu
+          go test -run '^$' -bench . -benchmem -benchtime 1s -count 1 . | tee bench.txt
+      - name: Compose the release description
+        shell: bash
+        run: |
+          set -eu
+          {
+            echo "## Benchmarks"
+            echo
+            echo '`go test -run "^$" -bench . -benchmem -benchtime 1s .` on the release runner'
+            echo "($(nproc) cores, $(go version), $(date -u +%F)). The throughput column comes"
+            echo 'from the benchmarks that call `b.SetBytes`; the rest are per-message costs.'
+            echo
+            echo '```'
+            grep -E '^(goos|goarch|pkg|cpu|Benchmark|PASS|ok|FAIL)' bench.txt
+            echo '```'
+          } > release-body.md
+          cat release-body.md
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: out/*
+          # The action prepends body_path to the auto-generated notes, so the
+          # benchmark block leads and the commit list follows.
+          body_path: release-body.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true

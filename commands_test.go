@@ -354,7 +354,6 @@ func TestCommandIpcShare(t *testing.T) {
 func TestCommandCreateVariants(t *testing.T) {
 	f := newFixture(t)
 	const read = uint32(0x8000_0000)
-	const write = uint32(genericWrite)
 	const all = uint32(0x1000_0000)
 
 	t.Run("create new", func(t *testing.T) {

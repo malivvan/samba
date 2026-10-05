@@ -1,0 +1,30 @@
+# golangci-lint configuration. Schema v2, so it needs golangci-lint >= v2.
+#
+# CI pins the version this file was written against (.github/workflows/ci.yml),
+# and the job is expected to stay at zero findings: a lint gate that is allowed
+# to be red is not a gate. Adding a linter, or widening this file, means fixing
+# what it finds in the same change.
+version: "2"
+
+linters:
+  # The upstream "standard" group: errcheck, govet, ineffassign, staticcheck
+  # and unused. That is the set the whole tree currently passes.
+  default: standard
+
+  exclusions:
+    # Preset groups, not a general silencer. `std-error-handling` is what makes
+    # errcheck usable here: it covers the unchecked Close() on os.File and
+    # net.Conn, where the error cannot change what the server does, and would
+    # otherwise bury the findings that matter. The others suppress findings
+    # upstream knows to be false positives or deliberate Go style.
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+
+issues:
+  # Report everything: the defaults (50 per linter, 3 of the same kind) hide
+  # findings, which is exactly what a CI gate must not do.
+  max-issues-per-linter: 0
+  max-same-issues: 0

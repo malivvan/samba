@@ -159,7 +159,7 @@ func (t *LeaseTable) ReleaseConn(wid, idx int, gen uint16) {
 	for k, v := range t.m {
 		kept := v[:0]
 		for _, g := range v {
-			if !(g.Wid == wid && g.ConnIdx == idx && g.ConnGen == gen) {
+			if g.Wid != wid || g.ConnIdx != idx || g.ConnGen != gen {
 				kept = append(kept, g)
 				continue
 			}

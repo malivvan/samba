@@ -45,6 +45,33 @@ multichannel binding paths, a complete Kerberos login built from a real keytab
 and AP-REQ, the notifier and its inotify parsing, the resource limits, the
 timeout/panic/reconnect paths, and the CLI.
 
+### Continuous integration
+
+- **One workflow** (`.github/workflows/ci.yml`) replaces the three that were
+  split across `ci.yml`, `fuzz.yml` and `release.yml` — none of which had ever
+  run, because all three were triggered on a `main` branch that does not exist
+  here. It runs on every push, on pull requests, and weekly. The `test` job is a
+  matrix over Ubuntu, macOS and Windows running `gofmt`, `go vet`, a
+  `CGO_ENABLED=0` build, `go test ./...` and `go test -race ./...`; the other
+  jobs lint, generate coverage and send it to Coveralls, fuzz all four targets,
+  run the `smbclient` interop suite, and cross-build for `linux/arm64`.
+- The macOS and Windows legs are `continue-on-error`, because the server is
+  Linux-only and they cannot build yet. They are kept as the signal that
+  portability drift has appeared; only the Linux leg gates anything.
+- **A release is gated.** `release` runs only on a `v*` tag and needs `lint`,
+  `coverage`, `test` and `fuzz`, so it is skipped rather than published when any
+  of them fails. It builds both static binaries, smoke-tests `--version` and
+  `--check`, refuses a tag that disagrees with `Version` in `doc.go`, runs the
+  benchmarks and puts their output at the top of the release description.
+- **`golangci-lint`** has a configuration now (`.golangci.yml`, schema v2) and
+  the tree passes it at zero findings. Getting there fixed three real findings —
+  an allocation in `UTF16LE`, a dead field in `krbStep`, and two unchecked
+  `InotifyRmWatch` errors — and restated two deliberate test constructs instead
+  of suppressing them.
+- **`TestVersionMatchesChangelog`** is new: it pins the newest released
+  `CHANGELOG.md` heading to `Version`, the same drift the release job refuses to
+  publish.
+
 ## [1.4.0] — 2026-10-05
 
 First release of the Go implementation: a complete port of the SMB2/SMB3 server

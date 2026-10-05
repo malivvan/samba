@@ -134,7 +134,9 @@ func (n *notifier) run() {
 					w := watches[i]
 					watches = append(watches[:i], watches[i+1:]...)
 					if ifd != nil && !anyWatchWD(watches, w.wd) {
-						unix.InotifyRmWatch(int(ifd.Fd()), uint32(w.wd))
+						// Best effort: the watch may be gone already, and the
+						// completion reaches the client either way.
+						_, _ = unix.InotifyRmWatch(int(ifd.Fd()), uint32(w.wd))
 					}
 					n.conn.deferFrame(pendingFrame{notify: &notifyFired{
 						pend: w.pend, status: m.done.Status,
@@ -168,7 +170,8 @@ func (n *notifier) run() {
 				}
 				watches = kept
 				if ifd != nil {
-					unix.InotifyRmWatch(int(ifd.Fd()), uint32(wd))
+					// Best effort, exactly as in the DONE case above.
+					_, _ = unix.InotifyRmWatch(int(ifd.Fd()), uint32(wd))
 				}
 			}
 			for _, wd := range selfGone {

@@ -82,6 +82,33 @@ go test -run '^$' -fuzz FuzzParseLeaseCtx  -fuzztime 60s .
 Crashers are written to `testdata/fuzz/<Target>/`; they become permanent
 regression cases. CI runs a short smoke on every push and a longer run weekly.
 
+## CI
+
+Everything lives in one workflow, `.github/workflows/ci.yml`, which runs on
+every push, on pull requests, and weekly (Sunday 03:00 UTC, for the long fuzz
+run):
+
+| Job | What it does | Gates the release |
+|---|---|---|
+| `test` | `gofmt`, `go vet`, a `CGO_ENABLED=0` build, `go test ./...` and `go test -race ./...` on Ubuntu, macOS and Windows | yes (Linux leg) |
+| `lint` | `golangci-lint` with `.golangci.yml`, plus the guard that no shipping file imports `C` or `unsafe` | yes |
+| `coverage` | `go test -covermode=atomic -coverprofile`, the total printed, the profile uploaded as an artifact, and the result sent to Coveralls | yes |
+| `fuzz` | Every target in the table above, 60s each on a push and 15 minutes each weekly; crashers are uploaded as artifacts | yes |
+| `interop` | `bench/interop-smbclient.sh` against the built binary | no |
+| `cross-build` | `GOOS=linux GOARCH=arm64 go build ./...` | no |
+| `release` | Only on a `v*` tag: builds both static binaries, smoke-tests `--version` and `--check`, runs the benchmarks, and creates the GitHub release with the results in its description | — |
+
+Two things about that are deliberate and easy to mistake for mistakes:
+
+- **The macOS and Windows legs are `continue-on-error`.** The server is
+  Linux-only by design (`docs/PORTING.md`), so those legs cannot build yet. They
+  run so the drift is visible the day it changes, but only the Linux leg is a
+  gate — a red Windows leg never blocks lint, coverage or a release.
+- **`release` is gated by `needs`,** so it is skipped, not failed, when any of
+  `lint`, `coverage`, `test` or `fuzz` does not pass. It also refuses to publish
+  a tag that disagrees with `Version` in `doc.go`; `TestVersionMatchesChangelog`
+  catches the same drift before a tag exists.
+
 ## The host suites (`bench/`)
 
 These need a real client; they are the only way to validate against cifs.ko and

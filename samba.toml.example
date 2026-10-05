@@ -6,7 +6,7 @@
 
 # Bind address (ip:port). TCP 445 is the only transport: there is no NetBIOS
 # port 139, no RPC, no management API and no SMB Direct (RDMA).
-listen = "0.0.0.0:445"
+listen = "0.0.0.0:9445"
 
 # Worker goroutines, each with its own SO_REUSEPORT listener. 0 = one per CPU
 # core. SO_REUSEPORT lets the kernel spread connections across them.
@@ -16,14 +16,14 @@ workers = 0
 server_name = "SAMBA"
 
 # 0 = warn, 1 = info, 2 = debug.
-log_level = 1
+log_level = 2
 
 # Allow unauthenticated guest sessions. Defaults to true when no [[user]]
 # entries exist, false otherwise.
-# allow_guest = false
+allow_guest = true
 
 # Reject unsigned requests on authenticated sessions.
-require_signing = true
+require_signing = false
 
 # Require SMB3 encryption (AES-128/256-GCM/CCM) for all post-authentication
 # traffic. When false, encryption a client asks for (e.g. cifs `seal`) is still
@@ -68,8 +68,8 @@ oplocks = true
 # At least one share is required. `name` is the SMB share name, `path` must be
 # an existing directory. "IPC$" is reserved.
 [[share]]
-name = "data"
-path = "/srv/data"
+name = "public"
+path = "/home/malivvan/Public"
 
 # read_only = true
 
@@ -81,9 +81,9 @@ path = "/srv/data"
 
 # Optional user database. Set exactly one of `password` or `nt_hash` (32 hex
 # characters). NTLM users only; Kerberos principals come from the KDC.
-# [[user]]
-# name = "alice"
-# password = "secret"
+#[[user]]
+#name = "alice"
+#password = "secret"
 
 # [[user]]
 # name = "bob"

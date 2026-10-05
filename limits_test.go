@@ -165,8 +165,10 @@ func TestBudgetReleaseIsDefensive(t *testing.T) {
 
 func TestConnLimiter(t *testing.T) {
 	l := newConnLimiter(2)
-	if !l.Acquire() || !l.Acquire() {
-		t.Fatal("two connections must be allowed")
+	for i := range 2 {
+		if !l.Acquire() {
+			t.Fatalf("connection %d must be allowed", i+1)
+		}
 	}
 	if l.Acquire() {
 		t.Fatal("the third connection must be refused")
@@ -191,8 +193,10 @@ func TestConnLimiter(t *testing.T) {
 	if l.Count() != 0 {
 		t.Fatalf("count = %d after an unmatched release", l.Count())
 	}
-	if !l.Acquire() || !l.Acquire() {
-		t.Fatal("the limit must still be enforced")
+	for i := range 2 {
+		if !l.Acquire() {
+			t.Fatalf("slot %d must still be available", i+1)
+		}
 	}
 
 	unlimited := newConnLimiter(-1)

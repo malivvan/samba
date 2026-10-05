@@ -124,7 +124,7 @@ func (w *Writer) Pad8(base int) {
 // UTF16LE encodes s as UTF-16 little-endian (no BOM, no terminator).
 func UTF16LE(s string) []byte {
 	out := make([]byte, 0, len(s)*2)
-	for _, u := range []rune(s) {
+	for _, u := range s {
 		if u > 0xFFFF {
 			// Encode as a surrogate pair, exactly like Rust's encode_utf16.
 			u -= 0x10000

@@ -1,3 +1,7 @@
+.reasonix
+.idea
+.vscode
+
 # Build output
 /samba
 /out/
