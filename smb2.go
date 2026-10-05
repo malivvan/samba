@@ -280,8 +280,6 @@ type ProtoConn struct {
 	Wid     int
 	ConnIdx int
 	ConnGen uint16
-	// krbAcceptor is the lazily acquired Kerberos acceptor for this connection.
-	krbAcceptor *KerberosAcceptor
 }
 
 // NewProtoConn returns protocol state for a freshly accepted connection.

@@ -6,6 +6,40 @@ conventional commits.
 
 ## [Unreleased]
 
+### Kerberos removed
+
+- **Kerberos is gone, and so is its dependency.** NTLMv2 is now the only
+  authentication mechanism, `allow_guest` still enables anonymous sessions, and
+  the `auth` setting is gone entirely. The module no longer imports
+  `jcmturner/gokrb5/v8`, nor the transitive tree it dragged in (`aescts`,
+  `dnsutils`, `gofork`, `goidentity`, `rpc`, `go-uuid`, and through them
+  `golang.org/x/crypto` and `golang.org/x/net`) — exactly two dependencies
+  remain: `BurntSushi/toml` and `golang.org/x/sys`.
+- The reasoning is recorded in full in [AGENTS.md](AGENTS.md): this server is
+  aimed mainly at non-corporate users and at being reachable from the internet,
+  and real Kerberos deployments still lean on RC4-HMAC (etype 23), which has
+  known weaknesses. Shipping Kerberos meant shipping that option. If it is
+  needed later, the intent is an exported `Authenticator` interface that
+  registers additional mechanisms rather than a re-vendored acceptor.
+- **A Kerberos token is now refused explicitly, not downgraded.** The
+  `mechKrb5` case and the Kerberos OIDs stay in `spnego.go` so `sessionSetup`
+  can answer `STATUS_NOT_SUPPORTED`: without it the token would fall through to
+  the NTLM handler, which reads "no NTLMSSP token" as an anonymous peer and
+  would hand it a guest session wherever `allow_guest` is set.
+  `TestSessionSetupRefusesKerberos` pins that, and `TestHintAdvertisesNtlmOnly`
+  pins that Kerberos is never advertised in NEGOTIATE.
+- **A configuration that still carries `auth` or `[kerberos]` now fails at
+  startup** as an unknown key, instead of starting with the operator's
+  authentication policy silently dropped.
+- **The shared half of the authentication path was extracted** into `auth.go`.
+  `sessionSetupCtx` decodes the request once, and `establish` installs the
+  identity and its key, derives the signing and encryption contexts for the
+  negotiated dialect, and writes the response — for every mechanism, which is
+  the seam a future `Authenticator` interface would plug into.
+- Removed along the way: `docs/KERBEROS.md`, `bench/krb5/e2e.sh`, the `krb5.go`
+  acceptor with its tests, and the `auth`/`[kerberos]` material from the example
+  configuration, the man page, `--dump-config` and the distro packages.
+
 ### Repository layout, CLI and introspection
 
 - **`cmd/samba/` became `cmd/`**, so `go build ./cmd` is the server binary, the

@@ -38,11 +38,8 @@ const (
 	StatusNotADirectory         uint32 = 0xC000_0103
 	StatusCancelled             uint32 = 0xC000_0120
 	StatusFileClosed            uint32 = 0xC000_0128
-	// StatusTimeDifferenceAtDC signals Kerberos clock skew between
-	// client/server/KDC beyond policy (MS-ERREF).
-	StatusTimeDifferenceAtDC uint32 = 0xC000_0133
-	StatusIoDeviceError      uint32 = 0xC000_0185
-	StatusUserSessionDeleted uint32 = 0xC000_0203
+	StatusIoDeviceError         uint32 = 0xC000_0185
+	StatusUserSessionDeleted    uint32 = 0xC000_0203
 )
 
 // StatusFromErrno maps a Unix errno to the closest NTSTATUS.

@@ -497,16 +497,10 @@ func negotiateBody(srv *Srv, pc *ProtoConn, dialect, cipher uint16, respStart in
 	if srv.cfg.RequireSigning {
 		secmode |= securityModeSigningRequired
 	}
-	// The SPNEGO NegTokenInit2 hint advertises the mechanisms this server is
-	// willing to accept, Kerberos first so a Kerberos-capable client prefers it.
-	var mechs []Mech
-	if srv.cfg.Auth.AllowsKerberos() {
-		mechs = append(mechs, mechKrb5)
-	}
-	if srv.cfg.Auth.AllowsNTLM() {
-		mechs = append(mechs, mechNtlmssp)
-	}
-	hint := negInitHint(mechs)
+	// The SPNEGO NegTokenInit2 hint advertises the mechanisms this server
+	// accepts. NTLMSSP is the only one, but the hint still matters: Windows
+	// clients pick NTLMSSP from it rather than guessing.
+	hint := negInitHint([]Mech{mechNtlmssp})
 
 	body := respStart + 64
 	tx.U16(65)
@@ -577,26 +571,28 @@ func ssResp(tx *Writer, h *ReqHdr, st uint32, related bool, sid uint64, flags ui
 }
 
 // sessionSetup classifies the SPNEGO/raw security blob and routes it to the
-// mechanism that owns it, subject to the `auth` policy. Kerberos is preferred
-// when both are offered. A token for a mechanism that is disabled by policy is
-// rejected with STATUS_NOT_SUPPORTED (fail loudly).
+// mechanism that owns it. NTLMv2 is the only mechanism this server implements
+// (see the authentication note in AGENTS.md).
+//
+// A Kerberos token is still *recognized*, and refused with STATUS_NOT_SUPPORTED.
+// That is deliberate: classifyBlob cannot tell an AP-REQ from a blob it simply
+// does not understand, and the NTLM handler treats "no NTLMSSP token" as an
+// anonymous peer. Without this case a Kerberos client would be handed a guest
+// session wherever guest access is allowed, instead of being refused.
 func sessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Chain, tx *Writer) {
 	blob, ok := sessionSetupBlob(msg)
 	if !ok {
 		errResp(tx, h, StatusInvalidParameter, chain)
 		return
 	}
-	mech := classifyBlob(blob).Mech
-	allowKrb := srv.cfg.Auth.AllowsKerberos()
-	allowNTLM := srv.cfg.Auth.AllowsNTLM()
-
-	switch {
-	case mech == mechKrb5 && allowKrb:
-		kerberosSessionSetup(srv, pc, h, msg, chain, tx)
-	case (mech == mechNtlmssp || mech == mechUnknown) && allowNTLM:
+	switch mech := classifyBlob(blob).Mech; mech {
+	case mechNtlmssp, mechUnknown:
 		ntlmSessionSetup(srv, pc, h, msg, chain, tx)
+	case mechKrb5:
+		LogWarn("session_setup: refusing a Kerberos token; this build authenticates with NTLMv2 only")
+		errResp(tx, h, StatusNotSupported, chain)
 	default:
-		LogInfo("session_setup: no enabled auth mechanism for the offered token (auth=%s)", srv.cfg.Auth)
+		LogInfo("session_setup: no mechanism for the offered token (mech=%d)", mech)
 		errResp(tx, h, StatusNotSupported, chain)
 	}
 }
@@ -624,22 +620,24 @@ func sessionSetupBlob(msg []byte) ([]byte, bool) {
 	return sliceAt(msg, int(off), int(length))
 }
 
+// ntlmSessionSetup is the NTLMv2 SESSION_SETUP handler, and the only
+// authentication mechanism this server implements (see the authentication note
+// in AGENTS.md). It owns the three NTLM-specific legs — the CHALLENGE, the
+// AUTHENTICATE, and the multichannel session-binding handshake — and hands the
+// resulting identity to the shared establishment code in auth.go.
 func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Chain, tx *Writer) {
-	ssFlags, clientSecmode, blob, ok := parseSessionSetupReq(msg)
+	s, ok := newSessionSetup(srv, pc, h, msg, chain, tx)
 	if !ok {
-		errResp(tx, h, StatusInvalidParameter, chain)
 		return
 	}
-	spnego := isSPNEGO(blob)
-	binding := ssFlags&sessionFlagBinding != 0
-	signingRequired := srv.cfg.RequireSigning || uint16(clientSecmode)&securityModeSigningRequired != 0
+	signingRequired := s.signReqd
 
-	switch classifyToken(blob) {
+	switch classifyToken(s.blob) {
 	case TokenNegotiate:
 		// Interim: assign/locate the session id, stash a challenge in this
 		// connection's channel state, and respond with the NTLM CHALLENGE.
 		var sid uint64
-		if binding {
+		if s.binding {
 			// Bind to an existing session — it must already exist.
 			if h.SessionID == 0 {
 				errResp(tx, h, StatusUserSessionDeleted, chain)
@@ -651,24 +649,14 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 			}
 			sid = h.SessionID
 		} else {
-			// A client can ask for sessions far faster than for anything else,
-			// and each one costs a handle table and a tree map, so both the
-			// per-connection and the server-wide count are bounded.
-			if len(pc.Channels) >= maxSessionsPerConn {
-				LogWarn("refusing a session: %d already set up on this connection", len(pc.Channels))
-				errResp(tx, h, StatusInsufficientResources, chain)
-				return
-			}
 			var created bool
-			if sid, _, created = srv.sessions.Create(); !created {
-				LogWarn("refusing a session: the server is at its session limit (%d)", maxSessionsTotal)
-				errResp(tx, h, StatusInsufficientResources, chain)
+			if sid, created = s.createSession(); !created {
 				return
 			}
 		}
 		chain.SessionID = sid
 		ch := &ChannelState{
-			Pending: &PendingAuth{SPNEGO: spnego, Binding: binding},
+			Pending: &PendingAuth{SPNEGO: s.spnego, Binding: s.binding},
 			Preauth: pc.PreauthNeg,
 		}
 		randBytes(ch.Pending.Challenge[:])
@@ -677,8 +665,8 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 		}
 		pc.Channels[sid] = ch
 
-		token := ntlmChallenge(srv.cfg.ServerName, ch.Pending.Challenge, ntlmNegotiateFlags(blob))
-		if spnego {
+		token := ntlmChallenge(srv.cfg.ServerName, ch.Pending.Challenge, ntlmNegotiateFlags(s.blob))
+		if s.spnego {
 			token = spnegoWrapChallenge(token)
 		}
 		ssResp(tx, h, StatusMoreProcessingRequire, chain.Related, sid, 0, token)
@@ -706,7 +694,7 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 		}
 		ch.Pending = nil
 		chPreauth := ch.Preauth
-		wrapped := pending.SPNEGO || spnego
+		wrapped := pending.SPNEGO || s.spnego
 		var done []byte
 		if wrapped {
 			done = spnegoAcceptCompleted()
@@ -719,7 +707,7 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 			errResp(tx, h, StatusUserSessionDeleted, chain)
 			return
 		}
-		auth, _ := parseAuthenticate(blob)
+		auth, _ := parseAuthenticate(s.blob)
 
 		if pending.Binding {
 			// Channel binding: prove the same identity, then derive this
@@ -786,130 +774,40 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 			return
 		}
 
-		// First authentication on a fresh session.
-		type verdict int
-		const (
-			verdictUser verdict = iota
-			verdictGuest
-			verdictReject
-		)
-		v := verdictReject
-		var userKey [16]byte
-		var userName string
-		switch {
-		case auth != nil && !auth.IsAnonymous():
-			if nt, found := srv.users[strings.ToLower(auth.User)]; found {
-				if key, ok := verifyNTLMv2(&nt, auth, &pending.Challenge); ok {
-					v, userKey, userName = verdictUser, key, auth.User
-				}
-			} else if srv.allowGuest {
-				v = verdictGuest
-			}
-		case srv.allowGuest:
-			v = verdictGuest
-		}
-
-		switch v {
-		case verdictUser:
-			sref.Lock()
-			sref.SessionKey = userKey
-			sref.Established = true
-			sref.Guest = false
-			sref.SigningRequired = signingRequired
-			sref.User = userName
-			sref.Channels = 1
-			sref.Unlock()
-
-			chm := pc.Channel(sid)
-			chm.Established = true
-			chm.SigningRequired = signingRequired
-			sc := deriveSignCtx(dialect, &userKey, &chPreauth)
-			chm.Sign = &sc
-			// SMB3 encryption: derive keys when a cipher is negotiated. If the
-			// server requires encryption, set ENCRYPT_DATA so the client seals
-			// all subsequent traffic; otherwise stay ready to honor
-			// client-initiated encryption (e.g. cifs `seal`).
-			var ssFl = uint16(0)
-			if cipher != 0 && dialect == 0x0311 {
-				c2s, s2c := smb311EncryptionKeys(cipher, &userKey, &chPreauth)
-				chm.Enc = &EncCtx{Cipher: cipher, C2S: c2s, S2C: s2c}
-				if srv.cfg.Encrypt {
-					chm.Encrypt = true
-					ssFl |= sessionFlagEncryptData
-				}
-			}
-			encState := "off"
-			if chm.Enc != nil {
-				encState = "ready"
-			}
-			signState := "optional"
-			if signingRequired {
-				signState = "required"
-			}
-			LogInfo("session %x: user %q authenticated (signing %s, encryption %s)", sid, userName, signState, encState)
-			ssResp(tx, h, StatusSuccess, chain.Related, sid, ssFl, done)
-
-		case verdictGuest:
-			if srv.cfg.Encrypt {
-				// Guest/anonymous sessions carry no key and cannot be
-				// encrypted; refuse rather than let the client seal traffic the
-				// server cannot decrypt.
-				LogWarn("session %x: guest denied — encryption is required but guest sessions cannot be encrypted", sid)
-				delete(pc.Channels, sid)
-				srv.sessions.Remove(sid)
-				errResp(tx, h, StatusAccessDenied, chain)
-				return
-			}
-			sref.Lock()
-			sref.Established = true
-			sref.Guest = true
-			sref.Channels = 1
-			sref.Unlock()
-			pc.Channel(sid).Established = true
-			ssResp(tx, h, StatusSuccess, chain.Related, sid, sessionFlagIsGuest, done)
-
-		default:
+		// First authentication on a fresh session. Deciding who the peer is
+		// (and refusing when it is nobody) is the mechanism's whole job here;
+		// establishing the session is shared, so it happens in one place.
+		authed, v := ntlmVerdict(srv, auth, pending.Challenge, done)
+		if v == verdictReject {
 			user := ""
 			if auth != nil {
 				user = auth.User
 			}
 			LogWarn("session %x: logon failure for user %q", sid, user)
-			delete(pc.Channels, sid)
-			srv.sessions.Remove(sid)
-			errResp(tx, h, StatusLogonFailure, chain)
+			s.rejectSessionSetup(StatusLogonFailure)
+			return
 		}
+		s.establish(authed)
 
 	default:
-		// No NTLMSSP token at all (e.g. pure anonymous): guest if allowed.
-		// Guest/anonymous sessions carry no key, so they cannot be encrypted —
-		// if encryption is required, deny rather than let the client seal
-		// traffic we cannot decrypt.
+		// No NTLMSSP token at all (pure anonymous): a guest session, when the
+		// configuration allows one. A guest carries no key and so cannot be
+		// encrypted; that case is refused before anything is allocated, so the
+		// answer does not depend on whether the server happens to be full.
 		switch {
-		case srv.allowGuest && srv.cfg.Encrypt:
+		case !srv.allowGuest:
+			errResp(tx, h, StatusLogonFailure, chain)
+		case srv.cfg.Encrypt:
 			LogWarn("anonymous session denied: encryption is required but guest sessions cannot be encrypted")
 			errResp(tx, h, StatusAccessDenied, chain)
-		case srv.allowGuest:
-			if len(pc.Channels) >= maxSessionsPerConn {
-				LogWarn("refusing a session: %d already set up on this connection", len(pc.Channels))
-				errResp(tx, h, StatusInsufficientResources, chain)
-				return
-			}
-			sid, sref, created := srv.sessions.Create()
-			if !created {
-				LogWarn("refusing a session: the server is at its session limit (%d)", maxSessionsTotal)
-				errResp(tx, h, StatusInsufficientResources, chain)
-				return
-			}
-			sref.Lock()
-			sref.Established = true
-			sref.Guest = true
-			sref.Channels = 1
-			sref.Unlock()
-			pc.Channels[sid] = &ChannelState{Established: true, Preauth: pc.PreauthNeg}
-			chain.SessionID = sid
-			ssResp(tx, h, StatusSuccess, chain.Related, sid, sessionFlagIsGuest, nil)
 		default:
-			errResp(tx, h, StatusLogonFailure, chain)
+			sid, ready := s.createSession()
+			if !ready {
+				return
+			}
+			chain.SessionID = sid
+			pc.Channels[sid] = &ChannelState{Preauth: pc.PreauthNeg}
+			s.establish(sessionAuth{Guest: true})
 		}
 	}
 }

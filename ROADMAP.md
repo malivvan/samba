@@ -39,9 +39,10 @@ SMB2/SMB3 feature set and is fair game to implement.
 
 ## Later
 
-4. **Multi-leg Kerberos.** The acceptor handles the single-leg AP-REQ exchange
-   that cifs.ko and Windows perform and rejects multi-leg exchanges with a log
-   line. Supporting them needs per-channel acceptor-context persistence.
+4. **Kerberos.** Removed deliberately, along with the `jcmturner/gokrb5`
+   dependency; see the authentication note in [AGENTS.md](AGENTS.md). Bringing it
+   back would be an exported `Authenticator` interface rather than a re-vendored
+   acceptor.
 5. **SMB Direct (RDMA).** Designed but not implemented, and it needs hardware
    plus a userspace HCA path that Go cannot reach without CGO — see
    [docs/SMBDIRECT.md](docs/SMBDIRECT.md). The practical alternative today is
@@ -230,8 +231,9 @@ SMB2/SMB3 feature set and is fair game to implement.
   server) — deprecated in the spec itself for man-in-the-middle exposure.
 - [ ] **TODO**: `security = domain`: NT4 domain authentication via NETLOGON,
   including `net rpc join`.
-- [ ] **TODO**: `security = ads`: AD member-server operation — Kerberos (✓
-  implemented), LDAP directory lookups and DNS SRV service location are missing.
+- [ ] **[won't do]**: `security = ads`: AD member-server operation — Kerberos
+  (removed; see AGENTS.md), LDAP directory lookups and DNS SRV service location
+  are all missing, and a domain member is out of scope for this server.
 - [ ] **TODO**: `passdb backend` and its backends: `tdbsam`, `ldapsam`,
   `ldapsam_compat`, `mysql`, `xmlsam` and `guest`, with multiple backends chained
   in a list. Today users come from a static `[[user]]` list with NT hashes.
@@ -240,8 +242,8 @@ SMB2/SMB3 feature set and is fair game to implement.
 - [ ] **[out of scope]**: NT4 Primary Domain Controller functionality — SAM
   database, NETLOGON service, LSARPC/SAMR, group mapping via `group_mapping.tdb`
   and `net groupmap` (§13.4).
-- [ ] **TODO**: Clock-skew policy for Kerberos as a configurable value (the
-  acceptor uses the library default today).
+- [ ] **[won't do]**: Kerberos and its clock-skew policy — removed with the rest
+  of Kerberos (see AGENTS.md).
 
 ### Identity mapping (§14)
 

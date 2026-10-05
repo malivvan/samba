@@ -24,8 +24,8 @@ management API), and it serves every worker from its own
 .BR SO_REUSEPORT
 listener so the kernel spreads connections across CPU cores.
 .PP
-It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 and Kerberos (GSS-API/SPNEGO)
-authentication, SMB2/3 signing, SMB 3.1.1 preauth integrity, SMB3 multichannel,
+It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 authentication, SMB2/3 signing,
+SMB 3.1.1 preauth integrity, SMB3 multichannel,
 SMB3 encryption (AES-128/256-GCM and AES-128/256-CCM), byte-range locks,
 directory change notification, and read- and handle-caching leases.
 .PP
@@ -104,7 +104,7 @@ Listener goroutines, each with its own SO_REUSEPORT listener. 0 = one per CPU
 core.
 .TP
 .B server_name
-Advertised server name; also the default Kerberos SPN host (\fIcifs/<name>\fR).
+Advertised server name (\fB"SAMBA"\fR by default).
 .TP
 .B log_level
 0 = warn, 1 = info, 2 = debug.
@@ -140,16 +140,6 @@ Concurrent connections the server will serve, default 512. Each connection
 costs goroutines plus up to one maximum-size request frame of buffered data, so
 this is the main lever on worst-case memory use. \fB\-1\fR removes the limit.
 .TP
-.B auth
-\fB"ntlm"\fR, \fB"kerberos"\fR or \fB"both"\fR (the default; Kerberos is
-preferred with NTLM as fallback).
-.TP
-.B [kerberos]
-\fBenabled\fR (default true), \fBkeytab\fR (default
-\fI$KRB5_KTNAME\fR, then \fI/etc/krb5.keytab\fR), \fBspn\fR (default
-\fIcifs/<server_name>\fR) and \fBrealm\fR (parsed; the realm actually comes from
-the ticket).
-.TP
 .B [[share]]
 At least one is required: \fBname\fR, \fBpath\fR (an existing directory) and
 \fBread_only\fR (default false). Authorization is share-level only, so
@@ -157,7 +147,7 @@ At least one is required: \fBname\fR, \fBpath\fR (an existing directory) and
 .TP
 .B [[user]]
 \fBname\fR plus exactly one of \fBpassword\fR or \fBnt_hash\fR (32 hex
-characters). NTLM users only; Kerberos principals come from the KDC.
+characters), checked by NTLMv2. There is no directory service behind it.
 .SH FILES
 .TP
 .I /etc/samba/samba.toml
@@ -165,9 +155,6 @@ Conventional configuration path.
 .TP
 .I samba.toml
 Default when \fB\-\-config\fR is not given.
-.TP
-.I /etc/krb5.keytab
-Fallback keytab for the Kerberos acceptor.
 .SH EXAMPLES
 .PP
 .nf

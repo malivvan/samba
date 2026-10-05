@@ -1,14 +1,19 @@
 package samba
 
-// SPNEGO (RFC 4178) DER glue and mechanism negotiation.
+// SPNEGO (RFC 4178) DER glue and mechanism classification.
 //
-// This file owns the GSS/SPNEGO wire encoding shared by every auth mechanism —
-// the minimal DER writer/reader, the mechanism OIDs, the NegTokenInit2 hint
-// placed in the NEGOTIATE response, and classification of an inbound
-// SESSION_SETUP security blob into the mechanism plus the GSS token to hand the
-// acceptor. It is pure ASN.1 with no external dependency, so it is fully
-// unit-testable on any host; the NTLM-specific message bodies live in ntlm.go
-// and the Kerberos acceptor in krb5.go.
+// This file owns the SPNEGO wire encoding — the minimal DER writer/reader, the
+// mechanism OIDs, the NegTokenInit2 hint placed in the NEGOTIATE response, and
+// classification of an inbound SESSION_SETUP security blob into the mechanism
+// plus the token to hand the acceptor. It is pure ASN.1 with no external
+// dependency, so it is fully unit-testable on any host. The NTLM-specific
+// message bodies live in ntlm.go, and the session that a successful
+// authentication produces is established in auth.go.
+//
+// NTLMSSP is the only mechanism this server accepts. The Kerberos OIDs are
+// still recognized — so that a Kerberos token can be refused instead of being
+// mistaken for an anonymous one, which would be a downgrade — but nothing here
+// advertises or negotiates Kerberos. See the authentication note in AGENTS.md.
 
 // Mechanism OIDs.
 var (
@@ -16,22 +21,25 @@ var (
 	oidSPNEGO = []byte{0x2B, 0x06, 0x01, 0x05, 0x05, 0x02}
 	// oidNTLMSSP is 1.3.6.1.4.1.311.2.2.10.
 	oidNTLMSSP = []byte{0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0A}
-	// oidKrb5 is 1.2.840.113554.1.2.2.
+	// oidKrb5 is 1.2.840.113554.1.2.2. Not advertised: recognized only so a
+	// Kerberos token is refused rather than served as an anonymous session.
 	oidKrb5 = []byte{0x2A, 0x86, 0x48, 0x86, 0xF7, 0x12, 0x01, 0x02, 0x02}
 	// oidMSKrb5 is the legacy MS Kerberos alias Windows still sends:
 	// 1.2.840.48018.1.2.2.
 	oidMSKrb5 = []byte{0x2A, 0x86, 0x48, 0x82, 0xF7, 0x12, 0x01, 0x02, 0x02}
 )
 
-// Mech is a negotiated security mechanism.
+// Mech is a security mechanism seen on the wire.
 type Mech int
 
 const (
-	// MechKrb5 is Kerberos 5 (either the canonical or the MS OID).
+	// mechKrb5 is Kerberos 5 (either the canonical or the MS OID). It is
+	// recognized only so that sessionSetup can refuse it: this server does not
+	// implement Kerberos.
 	mechKrb5 Mech = iota
-	// MechNtlmssp is NTLMSSP.
+	// mechNtlmssp is NTLMSSP, the only mechanism this server accepts.
 	mechNtlmssp
-	// MechUnknown is an unrecognized or unsupported mechanism.
+	// mechUnknown is an unrecognized or unsupported mechanism.
 	mechUnknown
 )
 
@@ -132,8 +140,9 @@ func childrenTLV(buf []byte) []tlv {
 }
 
 // negInitHint builds the NegTokenInit2 advertised in the NEGOTIATE response
-// security buffer. Mechanisms are listed in the given order (Kerberos first so
-// a Kerberos-capable client prefers it); an empty list yields an empty buffer.
+// security buffer, mechanisms in the given order; an empty list yields an empty
+// buffer. Kerberos is skipped rather than advertised, however the list is built:
+// this server does not accept it (see the file comment).
 func negInitHint(mechs []Mech) []byte {
 	if len(mechs) == 0 {
 		return nil
@@ -142,8 +151,6 @@ func negInitHint(mechs []Mech) []byte {
 	for _, m := range mechs {
 		var oid []byte
 		switch m {
-		case mechKrb5:
-			oid = oidKrb5
 		case mechNtlmssp:
 			oid = oidNTLMSSP
 		default:
@@ -169,15 +176,16 @@ type Incoming struct {
 	// SPNEGO is true when the blob was SPNEGO-wrapped (vs a raw mech token);
 	// the response must be SPNEGO-wrapped to match.
 	SPNEGO bool
-	// Token is the mechanism token to feed the acceptor: for Kerberos the
-	// GSS-API AP-REQ (0x60 …), for NTLMSSP the NTLMSSP\0… message. For a bare
-	// SPNEGO NegTokenInit with no mechToken this is empty.
+	// Token is the mechanism token to feed the acceptor: for NTLMSSP the
+	// NTLMSSP\0… message. For a bare SPNEGO NegTokenInit with no mechToken this
+	// is empty.
 	Token []byte
 }
 
 // classifyBlob classifies a SESSION_SETUP security blob: SPNEGO NegTokenInit
-// (0x60 with the SPNEGO OID), SPNEGO NegTokenResp (0xA1), a raw GSS Kerberos
-// AP-REQ (0x60 with a Kerberos OID), or a raw NTLMSSP message.
+// (0x60 with the SPNEGO OID), SPNEGO NegTokenResp (0xA1), a raw GSS token (0x60
+// with a mechanism OID — a Kerberos AP-REQ is recognized so it can be refused),
+// or a raw NTLMSSP message.
 func classifyBlob(blob []byte) Incoming {
 	if len(blob) == 0 {
 		if startsWith(blob, ntlmSig) {
@@ -305,10 +313,12 @@ const (
 func negResp(state byte, mech Mech, token []byte) []byte {
 	var oid []byte
 	switch mech {
-	case mechKrb5:
-		oid = oidKrb5
 	case mechNtlmssp:
 		oid = oidNTLMSSP
+	case mechKrb5:
+		// Kept so a test can build a SPNEGO-wrapped Kerberos token to prove the
+		// server refuses it. The server never answers with a Kerberos OID.
+		oid = oidKrb5
 	}
 	inner := der(0xA0, []byte{0x0A, 0x01, state}) // negState ENUMERATED
 	if len(oid) > 0 {

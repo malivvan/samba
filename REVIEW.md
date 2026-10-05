@@ -8,7 +8,7 @@ here is a theoretical nit — each item was turned into code, and most into a te
 
 Scope: the transport (`server.go`, `zerocopy.go`, `notify.go`), the protocol
 layer (`smb2.go`, `handlers.go`, `pattern.go`), the filesystem layer (`vfs.go`),
-authentication (`ntlm.go`, `spnego.go`, `krb5.go`), crypto (`crypto.go`,
+authentication (`ntlm.go`, `spnego.go`, `auth.go`), crypto (`crypto.go`,
 `cmac.go`, `ccm.go`, `md4.go`), state (`session.go`, `lease.go`), configuration
 (`config.go`) and the resources they share.
 
@@ -27,7 +27,7 @@ authentication (`ntlm.go`, `spnego.go`, `krb5.go`), crypto (`crypto.go`,
 | R-9 | A peer with a zero receive window pinned the response writer | High | Fixed |
 | R-10 | The zero-copy pump had no stall detection | High | Fixed |
 | R-11 | A per-request warn line let a peer flood the log (disk/CPU) | Medium | Fixed |
-| R-12 | The Kerberos keytab was read once per logon (I/O amplification) | Medium | Fixed |
+| R-12 | The Kerberos keytab was read once per logon (I/O amplification) | Medium | Fixed, then obsolete |
 | R-13 | A panic in any connection or worker goroutine killed the process | High | Fixed |
 | R-14 | The panic handler itself could panic and kill the process | Medium | Fixed |
 | R-15 | `Start` after `Stop` left workers nothing could shut down (`Wait` hung) | Low | Fixed |
@@ -219,7 +219,7 @@ lost silently. Info and debug output are unchanged.
 **Verified.** `TestWarnRateLimit` (the burst is allowed, the bucket empties, and
 it refills with time).
 
-### R-12 — Kerberos keytab read per logon (Medium)
+### R-12 — Kerberos keytab read per logon (Medium) — obsolete
 
 **Attack.** The acceptor — and therefore the keytab parse — was built per
 connection (a port of the original design, where a GSS credential was not
@@ -234,6 +234,12 @@ fast (fatal when `auth = "kerberos"`, a warning when NTLM remains as a fallback)
 
 **Verified.** `TestKerberosAcceptorIsShared` (the same instance is returned, the
 error is memoised, and an NTLM-only policy needs no keytab).
+
+**Obsolete.** Kerberos was removed from the server entirely — including the
+acceptor, the keytab, the startup check and that test — so there is no keytab to
+read and the amplification is gone with the feature. See the authentication note
+in [AGENTS.md](AGENTS.md). The finding is left here because it is part of the
+record of this review, not because the code it describes still exists.
 
 ### R-13 — A panic in a goroutine killed the process (High)
 
@@ -403,8 +409,9 @@ Every finding above is covered by a test, and the review also added tests for th
 parts of the server that had none: every command and its parameter validation
 (`commands_test.go`), every decoder's error path (a truncation sweep in
 `malformed_test.go`), the session-setup policy and multichannel binding paths
-(`auth_test.go`), a complete Kerberos login built from a real keytab and AP-REQ
-(`krb5_test.go`), the notifier and its inotify parsing (`notify_test.go`), the
+(`auth_test.go`; that list included a complete Kerberos login built from a real
+keytab, since removed with the feature), the notifier and its inotify parsing
+(`notify_test.go`), the
 resource limits (`limits_test.go`, `caps_test.go`), the reconnect/panic/timeout
 paths (`hardening_test.go`) and the CLI (`cmd/main_test.go`).
 

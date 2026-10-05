@@ -26,9 +26,6 @@ func TestConfigDefaults(t *testing.T) {
 	if !cfg.Oplocks {
 		t.Error("oplocks must default on")
 	}
-	if cfg.Auth != AuthBoth {
-		t.Errorf("auth = %q", cfg.Auth)
-	}
 	if !cfg.GuestAllowed() {
 		t.Error("guest must be allowed when no users are defined")
 	}
@@ -66,6 +63,7 @@ func TestConfigValidation(t *testing.T) {
 		"[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n[[share]]\nname = \"A\"\npath = \"" + dir + "\"\n",
 		"listen = \"not-an-address\"\n[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n",
 		"auth = \"krb5\"\n[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n",
+		"[kerberos]\nkeytab = \"/tmp/kt\"\n[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n",
 		"[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n[[user]]\nname = \"u\"\n",
 		"[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n[[user]]\nname = \"u\"\npassword = \"p\"\nnt_hash = \"" + "aa" + "\"\n",
 		"[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n[[user]]\nname = \"u\"\nnt_hash = \"zz\"\n",
@@ -342,26 +340,24 @@ func TestSrvAccessors(t *testing.T) {
 	}
 }
 
-func TestConfigKerberosTable(t *testing.T) {
+// TestConfigRejectsRemovedAuthKeys pins the removal of Kerberos. `auth` and the
+// `[kerberos]` table are no longer known keys, so a configuration that still
+// carries them must fail at startup rather than quietly lose its policy — the
+// whole point of rejecting unknown keys.
+func TestConfigRejectsRemovedAuthKeys(t *testing.T) {
 	dir := t.TempDir()
-	raw := "auth = \"kerberos\"\n[kerberos]\nkeytab = \"/tmp/kt\"\nspn = \"cifs/x\"\nrealm = \"R\"\n" +
-		"[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n"
-	cfg, err := ParseConfig([]byte(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.Auth.AllowsKerberos() || cfg.Auth.AllowsNTLM() {
-		t.Fatalf("auth = %q", cfg.Auth)
-	}
-	if cfg.Kerberos == nil || cfg.Kerberos.Keytab != "/tmp/kt" || cfg.Kerberos.SPN != "cifs/x" || cfg.Kerberos.Realm != "R" {
-		t.Fatalf("kerberos table = %+v", cfg.Kerberos)
-	}
-	if cfg.Kerberos.Enabled != nil {
-		t.Fatal("enabled must default to unset (meaning true)")
-	}
-	// An unknown key inside the table is rejected.
-	raw = "[kerberos]\nnope = 1\n[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n"
-	if _, err := ParseConfig([]byte(raw)); err == nil {
-		t.Fatal("an unknown [kerberos] key must be rejected")
+	share := "[[share]]\nname = \"a\"\npath = \"" + dir + "\"\n"
+	for _, raw := range []string{
+		"auth = \"both\"\n" + share,
+		"auth = \"kerberos\"\n" + share,
+		"[kerberos]\nkeytab = \"/tmp/kt\"\nspn = \"cifs/x\"\nrealm = \"R\"\n" + share,
+	} {
+		_, err := ParseConfig([]byte(raw))
+		if err == nil {
+			t.Fatalf("must be rejected now that Kerberos is gone:\n%s", raw)
+		}
+		if !strings.Contains(err.Error(), "unknown key") {
+			t.Errorf("error should name the unknown key, got %v", err)
+		}
 	}
 }

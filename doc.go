@@ -1,10 +1,10 @@
 // Package samba is a from-scratch SMB2/SMB3 file server.
 //
-// It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 and Kerberos (GSS-API/SPNEGO)
-// authentication, SMB2/3 signing, SMB 3.1.1 preauth integrity, SMB3
-// multichannel, and SMB3 encryption (AES-128/256-GCM and AES-128/256-CCM). It
-// supports a user database, optional guest access, byte-range locks, leases
-// (read-caching and handle-caching), and directory change notification.
+// It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 authentication, SMB2/3 signing,
+// SMB 3.1.1 preauth integrity, SMB3 multichannel, and SMB3 encryption
+// (AES-128/256-GCM and AES-128/256-CCM). It supports a user database, optional
+// guest access, byte-range locks, leases (read-caching and handle-caching), and
+// directory change notification.
 //
 // The package is written entirely in pure Go: no CGO and no unsafe, so it is
 // statically linkable and memory safe.
@@ -43,6 +43,6 @@
 package samba
 
 // Version is the released feature level of the server. It tracks the SMB
-// feature set the server implements: SMB 2.0.2–3.1.1, NTLMv2 + Kerberos,
-// signing, preauth integrity, multichannel, encryption and leases.
+// feature set the server implements: SMB 2.0.2–3.1.1, NTLMv2, signing, preauth
+// integrity, multichannel, encryption and leases.
 const Version = "1.4.0"

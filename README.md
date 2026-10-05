@@ -6,21 +6,38 @@
 
 A from-scratch SMB2/SMB3 file server (an `smbd` replacement) written in **pure
 Go** — no CGO, no `unsafe`, anywhere in the module. It speaks SMB 2.0.2 through
-3.1.1 with **NTLMv2 and Kerberos (GSS-API/SPNEGO) authentication, SMB2/3
-signing, SMB 3.1.1 preauth integrity, SMB3 multichannel, and SMB3 encryption
-(AES-128/256-GCM, AES-128/256-CCM)**, plus a user database, optional guest
-access, byte-range locks, leases (read- and handle-caching) and directory change
-notification.
+3.1.1 with **NTLMv2 authentication, SMB2/3 signing, SMB 3.1.1 preauth
+integrity, SMB3 multichannel, and SMB3 encryption (AES-128/256-GCM,
+AES-128/256-CCM)**, plus a user database, optional guest access, byte-range
+locks, leases (read- and handle-caching) and directory change notification.
 
 Large unsigned file reads never copy through userspace: the response header is
 written and the kernel then moves the file's page-cache pages straight into the
 socket through splice(2).
 
+> ### NTLMv2 only: Kerberos was removed
+>
+> This server authenticates with **NTLMv2, and nothing else**. Kerberos support
+> was deleted outright, along with the `jcmturner/gokrb5` dependency and its
+> whole transitive tree.
+>
+> The reasoning is that this server is meant mainly for **non-corporate users**,
+> and to be **reachable from the internet without compromising security**.
+> Kerberos only pays for itself beside a KDC, and the deployments that do need
+> it still fall back to RC4-HMAC (etype 23), which has known weaknesses — so
+> shipping it means shipping that option. `allow_guest` is still there for
+> anonymous access, and there is no `auth` setting to select: with one mechanism
+> there is nothing to choose.
+>
+> If Kerberos is needed later, the intent is to add an exported `Authenticator`
+> interface that registers additional mechanisms, rather than hard-wiring
+> another one. See [AGENTS.md](AGENTS.md) for the full note.
+
 ## Status
 
 **Stable (`1.4`).** The configuration format and the on-wire behaviour match the
 1.x feature level the server implements; the SMB2 frame entry point, the NTLMSSP
-parser, the SPNEGO/GSS classifier and the lease-context walker are fuzzed.
+parser, the SPNEGO classifier and the lease-context walker are fuzzed.
 
 - **Memory safe by construction.** The whole module is pure Go. CI rejects any
   change that introduces `import "C"` or `unsafe`, and builds with
@@ -33,8 +50,9 @@ parser, the SPNEGO/GSS classifier and the lease-context walker are fuzzed.
   the dialects a client offers are not checked. An SMB2-capable client upgrades
   normally; an SMB1-only client (e.g. some BMCs) cannot parse the reply and
   hangs until it times out (~20 s) instead of being refused.
-- **Kerberos single-leg only.** The acceptor handles a complete AP-REQ exchange
-  (what cifs.ko and Windows send). A multi-leg exchange is logged and rejected.
+- **NTLMv2 is the only mechanism.** Kerberos was removed deliberately — see the
+  note above. A client offering only Kerberos is refused with
+  `STATUS_NOT_SUPPORTED`, never downgraded to a guest session.
 
 Set `encrypt = true` to require encryption, or just mount with `seal` (Linux) /
 an encrypted share (Windows). `prefer_aes256` selects AES-256 when offered.
@@ -158,7 +176,7 @@ and `--check` can never disagree about what a configuration means.
 |---|---|---|
 | `listen` | `"0.0.0.0:445"` | Bind address (`ip:port`). |
 | `workers` | `0` | Listener goroutines, each with its own `SO_REUSEPORT` listener. `0` = one per CPU core. |
-| `server_name` | `"SAMBA"` | Advertised server name; also the default Kerberos SPN host (`cifs/<server_name>`). |
+| `server_name` | `"SAMBA"` | Advertised server name. |
 | `log_level` | `1` | `0` = warn, `1` = info, `2` = debug. |
 | `allow_guest` | true if there are no `[[user]]` entries, else false | Allow unauthenticated guest sessions. |
 | `require_signing` | `false` | Reject unsigned requests on authenticated sessions. |
@@ -168,10 +186,8 @@ and `--check` can never disagree about what a configuration means.
 | `advertise_only` | `[]` | Addresses to advertise for multichannel; empty = every non-loopback interface. |
 | `oplocks` | `true` | Grant leases: read-caching and handle-caching (R/RH). Write-caching is never granted. |
 | `max_connections` | `512` | Concurrent connections the server will serve. The main lever on worst-case memory use; `-1` removes the limit. |
-| `auth` | `"both"` | `"ntlm"`, `"kerberos"` or `"both"` (Kerberos preferred). |
-| `[kerberos]` | absent | `enabled` (default true), `keytab` (default `$KRB5_KTNAME`, then `/etc/krb5.keytab`), `spn` (default `cifs/<server_name>`), `realm` (parsed; the realm actually comes from the ticket). |
 | `[[share]]` | at least one required | `name`, `path` (must be an existing directory), `read_only` (default false). `IPC$` is reserved. |
-| `[[user]]` | none | `name` plus exactly one of `password` or `nt_hash` (32 hex chars). NTLM users only; Kerberos principals come from the KDC. |
+| `[[user]]` | none | `name` plus exactly one of `password` or `nt_hash` (32 hex chars), checked by NTLMv2. There is no directory service behind it. |
 
 ```toml
 listen = "0.0.0.0:445"
@@ -228,12 +244,11 @@ mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,se
 # Encrypted
 mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,seal
 
-# Kerberos (needs a ticket: kinit alice@REALM)
-mount -t cifs //server.example.com/data /mnt -o sec=krb5,vers=3.1.1
-
 # Multichannel (server has multichannel = true)
 mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,multichannel,max_channels=4
 ```
+
+Kerberos (`sec=krb5`) is not available: see the note at the top.
 
 ## Using the package
 
@@ -264,7 +279,6 @@ go doc github.com/malivvan/samba
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | benchmark method, measured numbers, tuning findings |
 | [docs/TUNING.md](docs/TUNING.md) | jumbo frames, TCP buffers, NIC/RSS, multichannel |
 | [docs/OPLOCKS.md](docs/OPLOCKS.md) | leases: what is granted, when it breaks, cross-worker delivery |
-| [docs/KERBEROS.md](docs/KERBEROS.md) | keytabs, SPNs, `auth`, troubleshooting |
 | [docs/FIPS.md](docs/FIPS.md) | FIPS 140-3 mode and what it does and does not cover |
 | [docs/CONCURRENCY.md](docs/CONCURRENCY.md) | why requests within one connection stay serialized |
 | [docs/SMBDIRECT.md](docs/SMBDIRECT.md) | SMB Direct (RDMA) design sketch — not implemented |

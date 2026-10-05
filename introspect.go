@@ -114,15 +114,6 @@ func (s *Srv) Capabilities() []Capability {
 		encryption += ", AES-256 preferred"
 	}
 
-	kerberos := "off"
-	if cfg.Auth.AllowsKerberos() {
-		spn := "cifs/" + cfg.ServerName
-		if cfg.Kerberos != nil && cfg.Kerberos.SPN != "" {
-			spn = cfg.Kerberos.SPN
-		}
-		kerberos = "GSS-API/SPNEGO from a keytab, SPN " + spn
-	}
-
 	multichannel := "off"
 	if cfg.Multichannel {
 		n := 0
@@ -136,8 +127,7 @@ func (s *Srv) Capabilities() []Capability {
 
 	return []Capability{
 		{Name: "dialects", Detail: "SMB 2.0.2 through 3.1.1", Enabled: true},
-		{Name: "ntlmv2", Detail: "local user database", Enabled: cfg.Auth.AllowsNTLM()},
-		{Name: "kerberos", Detail: kerberos, Enabled: cfg.Auth.AllowsKerberos()},
+		{Name: "ntlmv2", Detail: "local user database; the only mechanism", Enabled: true},
 		{Name: "guest", Detail: "unauthenticated sessions", Enabled: s.allowGuest},
 		{Name: "signing", Detail: signing, Enabled: true},
 		{Name: "encryption", Detail: encryption, Enabled: true},

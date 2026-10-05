@@ -23,7 +23,7 @@ listen = "0.0.0.0:445"
 # core. SO_REUSEPORT lets the kernel spread connections across them.
 workers = 0
 
-# Advertised server name. Also the default Kerberos SPN host (cifs/<name>).
+# Advertised server name.
 server_name = "SAMBA"
 
 # 0 = warn, 1 = info, 2 = debug. At info and above the startup banner reports
@@ -70,16 +70,10 @@ oplocks = true
 # container. -1 removes the limit.
 # max_connections = 512
 
-# Authentication mechanisms: "ntlm", "kerberos" or "both" (Kerberos preferred,
-# NTLM fallback). Kerberos also needs the [kerberos] table below.
-# auth = "both"
-
-# Kerberos acceptor settings. Only consulted when `auth` permits Kerberos.
-# [kerberos]
-# enabled = true
-# keytab = "/etc/krb5.keytab"           # defaults to $KRB5_KTNAME, then the system keytab
-# spn = "cifs/fileserver.example.com"   # defaults to cifs/<server_name>
-# realm = "EXAMPLE.COM"                 # the realm actually comes from the ticket
+# Authentication is NTLMv2 against the [[user]] table below, plus guest sessions
+# when `allow_guest` is set. There is no mechanism selector and no Kerberos: it
+# was removed deliberately (see AGENTS.md), so `auth` and `[kerberos]` are
+# rejected as unknown keys if they are left in an older file.
 
 # At least one share is required. `name` is the SMB share name, `path` must be
 # an existing directory, `read_only` (default false) applies to every user:
@@ -97,7 +91,8 @@ path = "/srv/data"
 # read_only = true
 
 # Optional user database for NTLMv2. Set exactly one of `password` or `nt_hash`
-# (32 hex characters). Kerberos principals come from the KDC, not from here.
+# (32 hex characters). This is the whole account store: there is no directory to
+# check against.
 # [[user]]
 # name = "alice"
 # password = "secret"

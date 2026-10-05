@@ -272,3 +272,44 @@ func spnegoWrapChallenge(token []byte) []byte {
 
 // spnegoAcceptCompleted is a NegTokenResp with negState = accept-completed.
 func spnegoAcceptCompleted() []byte { return negResp(acceptCompleted, mechUnknown, nil) }
+
+// verdict is what NTLM decides about an AUTHENTICATE, once the response has
+// been checked against the challenge this server issued.
+type verdict int
+
+const (
+	// verdictReject means the credentials did not verify, or there is no
+	// identity to grant and guest access is off.
+	verdictReject verdict = iota
+	// verdictUser means a known user authenticated; the session gets its key.
+	verdictUser
+	// verdictGuest means the peer is anonymous and the configuration allows
+	// guest sessions.
+	verdictGuest
+)
+
+// ntlmVerdict verifies an AUTHENTICATE against the challenge and decides who
+// the peer is. It performs no I/O and writes nothing: the caller hands the
+// result to establish (auth.go), which owns the response, so a mechanism can
+// never half-establish a session or answer twice.
+//
+// A user that the database does not know is a guest when guest access is
+// allowed, matching how a Windows peer with no matching account is treated; a
+// wrong password is always a refusal, never a silent downgrade to guest.
+func ntlmVerdict(srv *Srv, auth *Authenticate, challenge [8]byte, done []byte) (sessionAuth, verdict) {
+	switch {
+	case auth != nil && !auth.IsAnonymous():
+		if nt, found := srv.users[strings.ToLower(auth.User)]; found {
+			if key, ok := verifyNTLMv2(&nt, auth, &challenge); ok {
+				return sessionAuth{User: auth.User, Key: key, Token: done}, verdictUser
+			}
+			return sessionAuth{}, verdictReject
+		}
+		if srv.allowGuest {
+			return sessionAuth{Guest: true, Token: done}, verdictGuest
+		}
+	case srv.allowGuest:
+		return sessionAuth{Guest: true, Token: done}, verdictGuest
+	}
+	return sessionAuth{}, verdictReject
+}

@@ -154,13 +154,18 @@ func FuzzNTLM(f *testing.F) {
 	})
 }
 
-// FuzzClassifyBlob covers the SPNEGO/GSS token classifier, which parses
+// FuzzClassifyBlob covers the SPNEGO token classifier, which parses
 // attacker-controlled DER before any mechanism is chosen.
 func FuzzClassifyBlob(f *testing.F) {
+	f.Add(negInitHint([]Mech{mechNtlmssp}))
 	f.Add(negInitHint([]Mech{mechKrb5, mechNtlmssp}))
 	f.Add(spnegoHint())
 	f.Add(spnegoWrapChallenge([]byte("NTLMSSP\x00fake")))
+	// Kerberos is not implemented, but its tokens still reach this parser and
+	// must be classified (so that sessionSetup can refuse them) rather than
+	// mistaken for something else.
 	f.Add(negResp(acceptCompleted, mechKrb5, []byte("ap-rep")))
+	f.Add(buildKrbBlob())
 	f.Add([]byte{0x60, 0x82, 0x01, 0x00})
 	f.Add([]byte{0xA1, 0x05, 0x30, 0x03, 0xA2, 0x01, 0x00})
 	f.Add([]byte{})
@@ -189,7 +194,6 @@ func FuzzClassifyBlob(f *testing.F) {
 				t.Fatal("the classified token must alias the input blob")
 			}
 		}
-		_, _ = unwrapGSSAPREQ(inc.Token)
 	})
 }
 

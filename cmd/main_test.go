@@ -113,15 +113,24 @@ func TestRunServesAndStops(t *testing.T) {
 
 // TestRunStartupFailure checks that a configuration the server cannot serve
 // fails fast with a diagnostic rather than starting half-way.
-func TestRunStartupFailure(t *testing.T) {
-	// auth = "kerberos" with no usable keytab must not start.
-	path := writeConfig(t, "auth = \"kerberos\"\n[kerberos]\nkeytab = \"/nonexistent.keytab\"\n")
-	var out, errOut strings.Builder
-	if code := run([]string{"--config", path}, &out, &errOut, nil); code != 2 {
-		t.Fatalf("exit code = %d, stderr = %q", code, errOut.String())
-	}
-	if !strings.Contains(errOut.String(), "kerberos") {
-		t.Fatalf("stderr = %q", errOut.String())
+// TestRunRejectsRemovedAuthSettings is the migration guard: a configuration
+// written for the Kerberos-capable build carries `auth` and `[kerberos]`, which
+// are no longer known keys. It must fail loudly at startup rather than start
+// with the operator's authentication policy silently dropped.
+func TestRunRejectsRemovedAuthSettings(t *testing.T) {
+	for _, extra := range []string{
+		"auth = \"kerberos\"\n",
+		"auth = \"both\"\n",
+		"[kerberos]\nkeytab = \"/etc/krb5.keytab\"\nspn = \"cifs/files.example.com\"\n",
+	} {
+		path := writeConfig(t, extra)
+		var out, errOut strings.Builder
+		if code := run([]string{"--config", path}, &out, &errOut, nil); code != 2 {
+			t.Errorf("%q: exit code = %d, want 2", extra, code)
+		}
+		if !strings.Contains(errOut.String(), "unknown key") {
+			t.Errorf("%q: stderr = %q, want the unknown key named", extra, errOut.String())
+		}
 	}
 }
 

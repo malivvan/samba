@@ -277,27 +277,3 @@ func TestCreateWithoutLeaseWhenTableIsFull(t *testing.T) {
 		t.Fatalf("granted oplock = %#x, want none when the table is full", oplock)
 	}
 }
-
-func TestKerberosAcceptorIsShared(t *testing.T) {
-	srv := testSrv(t, t.TempDir(), nil)
-	srv.cfg.Auth = AuthNTLM
-	// With NTLM-only policy no keytab is needed, and the check is a no-op.
-	if err := srv.checkKerberos(); err != nil {
-		t.Fatalf("checkKerberos with auth=ntlm: %v", err)
-	}
-	// The acceptor itself is built once and shared, so a client cannot drive a
-	// keytab read per logon.
-	srv.cfg.Auth = AuthBoth
-	srv.cfg.Kerberos = &KerberosCfg{Keytab: "/nonexistent/keytab"}
-	first, err := srv.kerberosAcceptor()
-	if err == nil {
-		t.Fatal("a missing keytab must be an error")
-	}
-	if first != nil {
-		t.Fatal("no acceptor on error")
-	}
-	second, err2 := srv.kerberosAcceptor()
-	if err2 != err || second != first {
-		t.Fatal("the acceptor must be built once and its error remembered")
-	}
-}

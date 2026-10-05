@@ -43,7 +43,7 @@ loop, not an occasional extra.
 | `wire_test.go` | Reader/Writer round trips, bounds behaviour, UTF-16LE (including surrogate pairs), patching, padding |
 | `crypto_test.go` | MD4 (RFC 1320 vectors), NT hash, HMAC-MD5 reference value, HMAC-SHA256, AES-CMAC (RFC 4493 vectors), RC4 (known answer), AES-CCM (RFC 3610 vectors), AES-GCM (NIST vector), AEAD round trip plus tamper/wrong-key/wrong-AAD rejection, cipher parameters, the SP800-108 layout, SMB 3.1.1 key derivation |
 | `ntlm_test.go` | Token classification (raw and SPNEGO-wrapped), CHALLENGE shape, a full NTLMv2 challenge/response round trip, wrong password and tampered challenge rejection, the RC4 key-exchange path |
-| `spnego_test.go` | DER length forms, the mechanism hint (Kerberos before NTLM), classification of SPNEGO-wrapped and raw Kerberos tokens, raw NTLMSSP, NegTokenResp round trip, malformed-blob robustness |
+| `spnego_test.go` | DER length forms, the mechanism hint (NTLMSSP only — Kerberos must never be advertised), classification of SPNEGO-wrapped and raw tokens including a Kerberos AP-REQ, raw NTLMSSP, NegTokenResp round trip, malformed-blob robustness |
 | `config_test.go` | Defaults, unknown-key rejection, every validation rule, the user database (password and `nt_hash`), guest defaults, and a guard that the shipped `samba.toml.example` loads |
 | `vfs_test.go` | Traversal/NUL rejection, handle-table generation safety, FILETIME conversion and `UTIME_OMIT` sentinels, directory snapshot patterns and hidden-attribute handling, errno → NTSTATUS mapping |
 | `lease_test.go` | Mailbox post/drain and wake semantics, lease grant/refresh, break-only-conflicting-keys, unleased writers break everything, connection teardown releases its grants |
@@ -52,8 +52,7 @@ loop, not an occasional extra.
 | `smb2_test.go` | The protocol end to end through `ProcessFrame`: a full session (negotiate → session setup → tree connect → create → write → read → query directory → close), traversal rejection, the zero-copy read plan, NTLMv2 authentication with signing enforcement and response-signature verification, SMB 3.1.1 preauth chaining with an independently recomputed signing key, transform round trip plus tamper, response batching, SMB1 wildcard, undecryptable-frame disconnect, credit clamping |
 | `commands_test.go` | Every SMB2 command on a real session: NEGOTIATE variants and cipher choice, the session-setup policy and multichannel binding, TREE_CONNECT/DISCONNECT (including the `IPC$` stub), every CREATE disposition and its errors, READ/WRITE/FLUSH/CLOSE, every QUERY_INFO and SET_INFO class, all six QUERY_DIRECTORY classes plus continuation and restart, LOCK (shared, exclusive, unlock, conflicts, batch unwind), IOCTL, CHANGE_NOTIFY, LOGOFF, compounds, and lease grants |
 | `malformed_test.go` | Every request truncated at every length: the server must answer with a protocol error, never panic, never accept garbage and never drop the connection — the error branch of every body decoder in one sweep |
-| `auth_test.go` | The session-setup branches: SPNEGO wrapping, re-authentication, guest and anonymous decisions, encryption-required refusals, mechanism policy, and the full multichannel channel-binding handshake (accepted, rejected, and guest) |
-| `krb5_test.go` | A complete Kerberos login built from a real keytab and AP-REQ (ticket decryption, authenticator, sub-session key as the SMB session key, signing, SPNEGO wrapping), a foreign keytab rejected, and the acceptor's failure and policy paths |
+| `auth_test.go` | The session-setup branches: SPNEGO wrapping, re-authentication, guest and anonymous decisions, encryption-required refusals, the refusal of a Kerberos token, and the full multichannel channel-binding handshake (accepted, rejected, and guest) |
 | `limits_test.go`, `caps_test.go` | The resource limits and the budget's blocking/shutdown semantics, and the protocol-level refusal of each cap |
 | `hardening_test.go` | The transport's hardening: the connection cap, incomplete-frame reaping, the zero-copy stall deadline and its correctness, break routing, deferred-frame writing, panic containment, and clean shutdown |
 | `edge_test.go` | The remaining edges: AEAD and CMAC error paths, the CCM length-prefix forms, `clamp`/`isHex`, handle-table misses, the response write stall, and path/metadata variants |
@@ -92,7 +91,7 @@ go test -run '^$' -fuzz FuzzParseLeaseCtx  -fuzztime 60s .
 |---|---|
 | `FuzzProcessFrame` | The SMB2 wire entry point: header decode, compound dispatch, and every command's body/offset/length parsing, against a read-only temp share with fresh protocol state per input. It also checks an invariant on the output: every framed response must be complete and well formed, and a zero-copy plan must be bounded. |
 | `FuzzNTLM` | NTLMSSP token location, classification, the AUTHENTICATE field decoder, and verification on whatever came out. |
-| `FuzzClassifyBlob` | The SPNEGO/GSS DER classifier, including the invariant that a recognized token is a slice of the input rather than synthesized bytes. |
+| `FuzzClassifyBlob` | The SPNEGO DER classifier, including the invariant that a recognized token is a slice of the input rather than synthesized bytes. |
 | `FuzzParseLeaseCtx` | The `SMB2_CREATE_CONTEXT` walker, which must always terminate. |
 
 Crashers are written to `testdata/fuzz/<Target>/`; they become permanent
@@ -141,7 +140,6 @@ Windows.
 | `bench/win-interop.ps1` | Windows client: `net use`, list, read, write, and `Get-SmbConnection` to confirm dialect and signing. |
 | `bench/win-read.ps1` | Windows `.NET FileStream` streamed read throughput. |
 | `bench/win-multistream.ps1` | Windows concurrent multi-stream read and write. |
-| `bench/krb5/e2e.sh` | `sec=krb5` end to end against a live KDC (see [KERBEROS.md](KERBEROS.md)). |
 | `bench/stress/` | Concurrent-mount stress and a long soak, with a CSV artifact and an analyzer for leak verdicts. |
 
 ## Interop with a real client

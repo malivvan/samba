@@ -37,6 +37,33 @@ func spnegoWrapResp(token []byte) []byte {
 	return negResp(acceptIncomplete, mechNtlmssp, token)
 }
 
+// sessionSetupFrame builds a SESSION_SETUP request carrying a security blob.
+func sessionSetupFrame(msgID, sess uint64, blob []byte, flags, secmode uint8) []byte {
+	f := reqHdr(CmdSessionSetup, msgID, 0, sess)
+	f.U16(25)
+	f.U8(flags)
+	f.U8(secmode)
+	f.U32(0)
+	f.U32(0)
+	f.U16(88)
+	f.U16(uint16(len(blob)))
+	f.U64(0)
+	f.Bytes8(blob)
+	return f.Bytes()
+}
+
+// buildKrbBlob is a syntactically valid SPNEGO-wrapped Kerberos token. The
+// server does not implement Kerberos, so it must be refused — and refused
+// *explicitly*: the NTLM handler reads "no NTLMSSP token" as an anonymous peer,
+// so a token that merely fell through would be granted guest access wherever
+// allow_guest is set. This is what proves it does not.
+func buildKrbBlob() []byte {
+	body := derOID(oidKrb5)
+	body = append(body, 0x01, 0x00)
+	body = append(body, der(0x6E, []byte("token"))...)
+	return der(0x60, body)
+}
+
 // challengeFrom pulls the 8-byte challenge out of an NTLMSSP token.
 func challengeFrom(t *testing.T, body []byte) [8]byte {
 	t.Helper()
@@ -127,15 +154,6 @@ func TestSessionSetupReauthAcknowledges(t *testing.T) {
 }
 
 func TestSessionSetupPolicyAndGuestDenials(t *testing.T) {
-	t.Run("ntlm token with kerberos-only policy", func(t *testing.T) {
-		srv := ntlmSrv(t)
-		srv.cfg.Auth = AuthKerberos
-		pc := NewProtoConn(srv, 0, 0, 1)
-		r := roundtrip(t, srv, pc, sessionSetupFrame(1, 0, ntlmType1(0x0000_0001), 0, 1))
-		if r.status != StatusNotSupported {
-			t.Fatalf("status %#x, want NOT_SUPPORTED", r.status)
-		}
-	})
 	t.Run("anonymous with encryption required", func(t *testing.T) {
 		srv := testSrv(t, t.TempDir(), nil)
 		srv.cfg.Encrypt = true
@@ -464,14 +482,21 @@ func negotiateCipher(t *testing.T, srv *Srv, pc *ProtoConn, ciphers []uint16) ui
 	return pc.Cipher
 }
 
-func TestSessionSetupWithUnknownMechanism(t *testing.T) {
+// TestSessionSetupRefusesKerberos pins the downgrade guard: a Kerberos token is
+// refused outright, rather than falling through to the NTLM handler, which reads
+// an unrecognized blob as an anonymous peer and would grant it guest access.
+func TestSessionSetupRefusesKerberos(t *testing.T) {
 	srv := ntlmSrv(t)
-	srv.cfg.Auth = AuthNTLM
+	srv.cfg.AllowGuest = new(true)
+	srv.allowGuest = true
 	pc := NewProtoConn(srv, 0, 0, 1)
-	// A Kerberos token when only NTLM is allowed is refused loudly.
-	krb := buildFakeKrbBlob()
-	if r := roundtrip(t, srv, pc, sessionSetupFrame(1, 0, krb, 0, 1)); r.status != StatusNotSupported {
-		t.Fatalf("status %#x, want NOT_SUPPORTED", r.status)
+	if r := roundtrip(t, srv, pc, sessionSetupFrame(1, 0, buildKrbBlob(), 0, 1)); r.status != StatusNotSupported {
+		t.Fatalf("status %#x, want NOT_SUPPORTED (a Kerberos token must never be served as guest)", r.status)
+	}
+	// The same token SPNEGO-wrapped, which is how a real client sends it.
+	wrapped := negResp(acceptIncomplete, mechKrb5, []byte("ap-req"))
+	if r := roundtrip(t, srv, pc, sessionSetupFrame(2, 0, wrapped, 0, 1)); r.status != StatusNotSupported {
+		t.Fatalf("SPNEGO-wrapped status %#x, want NOT_SUPPORTED", r.status)
 	}
 }
 

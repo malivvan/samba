@@ -147,11 +147,12 @@ or synchronization. The transport only knows about framing and the
   FileId for related operations); responses are 8-byte aligned with
   `NextCommand` patched.
 - **SESSION_SETUP is a dispatcher**: `classifyBlob` identifies the security blob
-  (SPNEGO NegTokenInit/Resp, raw Kerberos AP-REQ, raw NTLMSSP) and routes it by
-  mechanism × the `auth` policy. NTLM verifies NTLMv2 against the `[[user]]`
-  database or accepts guest when allowed; Kerberos validates the AP-REQ against
-  the keytab. Either way the resulting session key feeds the SP800-108 KDF for
-  signing and encryption keys.
+  (SPNEGO NegTokenInit/Resp, a raw GSS token, raw NTLMSSP) and routes it by
+  mechanism. NTLMv2 is the only mechanism: it verifies against the `[[user]]`
+  database or accepts guest when allowed, and a Kerberos token is refused.
+  Either way the resulting session key feeds the SP800-108 KDF for signing and
+  encryption keys, and the session itself is established by `auth.go`, which
+  every mechanism shares.
 - **Signing**: HMAC-SHA256 (2.x) / AES-CMAC (3.x) verify-and-sign; authenticated
   sessions always sign their responses, including the final SESSION_SETUP.
   `require_signing` rejects unsigned requests.
@@ -188,6 +189,7 @@ or synchronization. The transport only knows about framing and the
   referrals are unsupported.
 - **No SMB Direct** ([SMBDIRECT.md](SMBDIRECT.md)), no registered buffers, and
   no HTTP health endpoint.
-- **Kerberos is single-leg**: a complete AP-REQ exchange is accepted, a
-  multi-leg one is rejected with a log line.
+- **Kerberos is not implemented at all**: a Kerberos token is refused with
+  `STATUS_NOT_SUPPORTED` rather than downgraded to a guest session. See the
+  authentication note in [AGENTS.md](../AGENTS.md).
 - **No external security review yet**; see [SECURITY.md](../SECURITY.md).

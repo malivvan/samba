@@ -1,8 +1,8 @@
 // Command samba is a from-scratch SMB2/SMB3 file server.
 //
-// It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 and Kerberos (GSS-API/SPNEGO)
-// authentication, SMB2/3 signing, SMB 3.1.1 preauth integrity, SMB3
-// multichannel, and SMB3 encryption (AES-128/256-GCM and -CCM), plus
+// It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 authentication, SMB2/3 signing,
+// SMB 3.1.1 preauth integrity, SMB3 multichannel, and SMB3 encryption
+// (AES-128/256-GCM and -CCM), plus
 // byte-range locks, leases, directory change notification and zero-copy reads.
 // It is written in pure Go — no CGO, no unsafe — so the whole server is
 // statically linkable and memory safe.
@@ -260,7 +260,6 @@ func describe(cfg *samba.Config, srv *samba.Server, workers int) []string {
 		line("max_read", strconv.Itoa(int(samba.MaxReadTarget)/1024)+" KiB"),
 		line("max_connections", conns),
 		line("log_level", logLevelName(cfg.LogLevel)),
-		line("auth", string(cfg.Auth)),
 		line("allow_guest", strconv.FormatBool(cfg.GuestAllowed())),
 		line("require_signing", strconv.FormatBool(cfg.RequireSigning)),
 		line("encrypt", strconv.FormatBool(cfg.Encrypt)),
@@ -415,23 +414,8 @@ func printConfig(w io.Writer, cfg *samba.Config) {
 	if cfg.MaxConnections != nil {
 		fmt.Fprintf(w, "max_connections = %d\n", *cfg.MaxConnections)
 	}
-	fmt.Fprintf(w, "auth = %q\n", cfg.Auth)
 	if len(cfg.AdvertiseOnly) > 0 {
 		fmt.Fprintf(w, "advertise_only = [%s]\n", quoteList(cfg.AdvertiseOnly))
-	}
-
-	if k := cfg.Kerberos; k != nil {
-		fmt.Fprintln(w, "\n[kerberos]")
-		fmt.Fprintf(w, "enabled = %t\n", k.Enabled == nil || *k.Enabled)
-		if k.Keytab != "" {
-			fmt.Fprintf(w, "keytab = %q\n", k.Keytab)
-		}
-		if k.SPN != "" {
-			fmt.Fprintf(w, "spn = %q\n", k.SPN)
-		}
-		if k.Realm != "" {
-			fmt.Fprintf(w, "realm = %q\n", k.Realm)
-		}
 	}
 
 	for _, sh := range cfg.Shares {

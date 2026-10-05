@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/BurntSushi/toml"
 )
@@ -51,52 +50,14 @@ type Config struct {
 	// the main lever on worst-case memory use (see the tuning notes); a negative
 	// value removes the limit.
 	MaxConnections *int `toml:"max_connections"`
-	// Auth selects the authentication mechanisms to advertise and accept.
-	Auth AuthMode `toml:"auth"`
-	// Kerberos holds the Kerberos acceptor settings.
-	Kerberos *KerberosCfg `toml:"kerberos"`
 	// Shares and Users are the [ [share] ] / [ [user] ] tables.
 	Shares []ShareCfg `toml:"share"`
 	Users  []UserCfg  `toml:"user"`
 }
 
-// AuthMode is the authentication mechanism selector.
-type AuthMode string
-
-const (
-	// AuthNTLM permits NTLMv2 only.
-	AuthNTLM AuthMode = "ntlm"
-	// AuthKerberos permits Kerberos only.
-	AuthKerberos AuthMode = "kerberos"
-	// AuthBoth advertises both; Kerberos is preferred with NTLM fallback.
-	AuthBoth AuthMode = "both"
-)
-
-// AllowsNTLM reports whether policy permits NTLM.
-func (a AuthMode) AllowsNTLM() bool { return a == AuthNTLM || a == AuthBoth }
-
-// AllowsKerberos reports whether policy permits Kerberos.
-func (a AuthMode) AllowsKerberos() bool { return a == AuthKerberos || a == AuthBoth }
-
-// KerberosCfg is the `[kerberos]` table.
-type KerberosCfg struct {
-	// Enabled turns the Kerberos acceptor on. Defaults to true when the table
-	// is present.
-	Enabled *bool `toml:"enabled"`
-	// Keytab holds the service key for the SPN. Falls back to $KRB5_KTNAME and
-	// then the system keytab when unset.
-	Keytab string `toml:"keytab"`
-	// SPN is the service principal, e.g. `cifs/fileserver.example.com`.
-	// Defaults to `cifs/<server_name>`.
-	SPN string `toml:"spn"`
-	// Realm is parsed for compatibility; the realm actually comes from the
-	// ticket and the system krb5.conf.
-	Realm string `toml:"realm"`
-}
-
 // UserCfg is one `[[user]]` entry: a name plus exactly one of password or a
-// precomputed NT hash (32 hex chars). NTLM users only; Kerberos principals come
-// from the KDC.
+// precomputed NT hash (32 hex chars). The user database is how NTLMv2 logons are
+// checked; there is no directory service behind it.
 type UserCfg struct {
 	Name     string `toml:"name"`
 	Password string `toml:"password"`
@@ -125,7 +86,6 @@ func newConfig() Config {
 		LogLevel:       LevelInfo,
 		Oplocks:        true,
 		MaxConnections: &maxConns,
-		Auth:           AuthBoth,
 	}
 }
 
@@ -195,11 +155,6 @@ func (c *Config) validate() error {
 		default:
 			return fmt.Errorf("user %q: set exactly one of password / nt_hash (32 hex chars)", u.Name)
 		}
-	}
-	switch c.Auth {
-	case AuthNTLM, AuthKerberos, AuthBoth:
-	default:
-		return fmt.Errorf("invalid auth %q: want \"ntlm\", \"kerberos\" or \"both\"", string(c.Auth))
 	}
 	return nil
 }
@@ -276,10 +231,6 @@ type Srv struct {
 	leases     *LeaseTable
 	// conns bounds the connections the server serves at once.
 	conns *connLimiter
-	// krb holds the Kerberos acceptor, built once on first use.
-	krbOnce sync.Once
-	krbAcc  *KerberosAcceptor
-	krbErr  error
 }
 
 // Config exposes the parsed configuration.
@@ -300,37 +251,6 @@ func (s *Srv) Sessions() *Registry { return s.sessions }
 
 // Leases is the file-keyed lease registry, shared across all workers.
 func (s *Srv) Leases() *LeaseTable { return s.leases }
-
-// kerberosAcceptor returns the shared Kerberos acceptor, building it once. The
-// keytab and settings are read-only after construction, so one acceptor serves
-// every connection (and, unlike a per-connection credential, the keytab is read
-// from disk once instead of once per logon — which also removes an I/O
-// amplification a client could otherwise drive).
-func (s *Srv) kerberosAcceptor() (*KerberosAcceptor, error) {
-	s.krbOnce.Do(func() {
-		spn := ""
-		keytabPath := ""
-		if kcfg := s.cfg.Kerberos; kcfg != nil {
-			spn = kcfg.SPN
-			keytabPath = kcfg.Keytab
-		}
-		if spn == "" {
-			spn = "cifs/" + s.cfg.ServerName
-		}
-		s.krbAcc, s.krbErr = NewKerberosAcceptor(spn, keytabPath)
-	})
-	return s.krbAcc, s.krbErr
-}
-
-// checkKerberos reports whether the Kerberos acceptor can be built, so a
-// misconfigured keytab is visible at startup rather than at the first logon.
-func (s *Srv) checkKerberos() error {
-	if !s.cfg.Auth.AllowsKerberos() {
-		return nil
-	}
-	_, err := s.kerberosAcceptor()
-	return err
-}
 
 // randBytes fills buf with cryptographically secure random bytes.
 func randBytes(buf []byte) {

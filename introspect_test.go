@@ -125,8 +125,12 @@ func TestCapabilitiesReflectConfig(t *testing.T) {
 			t.Errorf("%s is implemented and must report on", name)
 		}
 	}
-	if !strings.Contains(byName["kerberos"].Detail, "cifs/SMB-TEST") {
-		t.Errorf("kerberos detail should carry the default SPN, got %q", byName["kerberos"].Detail)
+	// NTLMv2 is the only mechanism, so it is always on and always says so.
+	if !byName["ntlmv2"].Enabled {
+		t.Error("ntlmv2 must report on: it is the only mechanism")
+	}
+	if _, reported := byName["kerberos"]; reported {
+		t.Error("Kerberos was removed and must not be reported as a capability")
 	}
 	if !strings.Contains(byName["resource limits"].Detail, "8 connections") {
 		t.Errorf("resource limits should report the configured cap, got %q",
@@ -168,8 +172,6 @@ func TestCapabilitiesWhenEverythingIsOn(t *testing.T) {
 	cfg.PreferAES256 = true
 	cfg.Multichannel = true
 	cfg.Oplocks = true
-	cfg.Auth = AuthBoth
-	cfg.Kerberos = &KerberosCfg{SPN: "cifs/files.example.com"}
 	srv := &Srv{
 		cfg:      *cfg,
 		sessions: NewRegistry(),
@@ -206,8 +208,8 @@ func TestCapabilitiesWhenEverythingIsOn(t *testing.T) {
 	if d := detail("multichannel"); !strings.Contains(d, "1 interface(s) advertised") {
 		t.Errorf("multichannel detail = %q, want only the non-loopback interface counted", d)
 	}
-	if d := detail("kerberos"); !strings.Contains(d, "cifs/files.example.com") {
-		t.Errorf("kerberos detail = %q, want the configured SPN", d)
+	if d := detail("ntlmv2"); !strings.Contains(d, "NTLM") && !strings.Contains(d, "mechanism") {
+		t.Errorf("ntlmv2 detail = %q, want it to describe the only mechanism", d)
 	}
 	if d := detail("leases"); !strings.Contains(d, "handle-caching") {
 		t.Errorf("leases detail = %q, want the lease types spelled out", d)

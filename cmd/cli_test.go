@@ -145,7 +145,7 @@ func TestCheckReportsCapabilities(t *testing.T) {
 	}
 	for _, want := range []string{
 		"config ok: 1 share",
-		"dialects", "ntlmv2", "kerberos", "guest", "signing", "encryption",
+		"dialects", "ntlmv2", "guest", "signing", "encryption",
 		"multichannel", "leases", "byte-range locks", "change notification",
 		"zero-copy reads", "compound requests", "resource limits",
 		"required on authenticated sessions",
@@ -154,6 +154,10 @@ func TestCheckReportsCapabilities(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("--check omits %q:\n%s", want, out)
 		}
+	}
+	// Kerberos was removed; it must not be advertised as a capability.
+	if strings.Contains(out, "kerberos") {
+		t.Errorf("--check still reports kerberos:\n%s", out)
 	}
 	if got := field(t, out, "workers"); got != "1" {
 		t.Errorf("workers = %q, want 1", got)
@@ -210,15 +214,19 @@ func TestDumpConfigRedactsSecrets(t *testing.T) {
 	}
 }
 
-func TestDumpConfigRendersKerberos(t *testing.T) {
-	path := writeConfig(t, "[kerberos]\nenabled = false\nspn = \"cifs/files.example.com\"\nkeytab = \"/etc/krb5.keytab\"\n")
+// TestDumpConfigOmitsRemovedSettings checks that the dump does not resurrect
+// settings the server no longer has: a dump that mentioned `auth` or
+// `[kerberos]` would read as though they were still configuration.
+func TestDumpConfigOmitsRemovedSettings(t *testing.T) {
+	path := writeConfig(t, "require_signing = true\n")
 	code, out, errOut := runCLI(t, "--dump-config", "--config", path)
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %q", code, errOut)
 	}
-	for _, want := range []string{"[kerberos]", "enabled = false", `spn = "cifs/files.example.com"`, `keytab = "/etc/krb5.keytab"`} {
-		if !strings.Contains(out, want) {
-			t.Errorf("--dump-config omits %q:\n%s", want, out)
+	lower := strings.ToLower(out)
+	for _, gone := range []string{"kerberos", "krb5", "\nauth", "auth ="} {
+		if strings.Contains(lower, gone) {
+			t.Errorf("--dump-config still mentions %q:\n%s", gone, out)
 		}
 	}
 }

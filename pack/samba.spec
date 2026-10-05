@@ -10,8 +10,8 @@ Requires:       systemd
 
 %description
 A from-scratch SMB2/SMB3 file server written entirely in Go (no CGO, no
-unsafe). It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 and Kerberos
-authentication, SMB2/3 signing, SMB 3.1.1 preauth integrity, SMB3
+unsafe). It speaks SMB 2.0.2 through 3.1.1 with NTLMv2 authentication, SMB2/3
+signing, SMB 3.1.1 preauth integrity, SMB3
 multichannel, and SMB3 encryption (AES-128/256-GCM and -CCM), plus byte-range
 locks, leases, and directory change notification. Large unsigned reads move
 file pages to the socket through splice(2) without entering userspace.

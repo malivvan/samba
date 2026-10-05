@@ -32,16 +32,15 @@ silently running in a non-FIPS mode.
 ## What it does **not** cover
 
 - **NTLM.** The NTLM path needs MD4 (the NT hash), MD5 (HMAC-MD5) and RC4 — none
-  of which are FIPS-approved. A FIPS deployment should use `auth = "kerberos"`
-  so no NTLM token is ever accepted, and should keep `allow_guest = false`.
+  of which are FIPS-approved. That is the whole authentication surface: Kerberos
+  was removed from this server, and `allow_guest = false` is the only way to
+  keep an unapproved token out. A FIPS deployment should therefore treat the
+  NTLM logon path as outside its boundary.
 - **The constructions implemented in this module.** `cmac.go`, `ccm.go` and the
   KDF in `crypto.go` are validated against their RFC test vectors (RFC 4493,
   RFC 3610, SP800-108) and are exercised by the fuzz targets, but they are not
   themselves a validated module. Only the underlying AES and SHA-2
   implementations are.
-- **Kerberos internals.** The AP-REQ decryption uses the AES-CTS enctypes from
-  the Kerberos library; whether those are approved depends on that
-  implementation, not on this one.
 
 If you need a fully validated end-to-end stack, validate that claim against your
 own FIPS boundary: the honest statement is "the AES and SHA-2 primitives come

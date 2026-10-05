@@ -3,7 +3,6 @@ package samba
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -140,15 +139,6 @@ func NewServer(cfg *Config) (*Server, error) {
 		maxConns = *cfg.MaxConnections
 	}
 	srv.conns = newConnLimiter(maxConns)
-	// Surface an unusable keytab at startup rather than at the first logon.
-	if err := srv.checkKerberos(); err != nil {
-		if cfg.Auth == AuthKerberos {
-			return nil, fmt.Errorf("auth = \"kerberos\" but the acceptor cannot be built: %w", err)
-		}
-		if cfg.Kerberos != nil {
-			LogWarn("kerberos: %v (Kerberos logons will fail; the configured fallback still works)", err)
-		}
-	}
 	s := &Server{srv: srv, stop: make(chan struct{})}
 	for i := range nworkers {
 		s.workers = append(s.workers, &worker{

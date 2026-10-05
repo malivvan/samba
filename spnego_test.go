@@ -5,21 +5,22 @@ import (
 	"testing"
 )
 
-func TestHintAdvertisesKerberosFirstThenNTLM(t *testing.T) {
+// TestHintAdvertisesNtlmOnly checks what NEGOTIATE tells a client this server
+// can do. Kerberos must never appear, even if a caller asks for it: advertising
+// a mechanism the server refuses would just produce a failed logon.
+func TestHintAdvertisesNtlmOnly(t *testing.T) {
 	h := negInitHint([]Mech{mechKrb5, mechNtlmssp})
 	if len(h) == 0 || h[0] != 0x60 {
 		t.Fatalf("hint must be an application-0 token, got % x", h)
 	}
-	krb := bytes.Index(h, oidKrb5)
-	ntlm := bytes.Index(h, oidNTLMSSP)
-	if krb < 0 || ntlm < 0 {
-		t.Fatal("both mechanism OIDs must be advertised")
-	}
-	if krb > ntlm {
-		t.Fatal("kerberos must be advertised before ntlm")
+	if !bytes.Contains(h, oidNTLMSSP) {
+		t.Fatal("the NTLMSSP OID must be advertised")
 	}
 	if !bytes.Contains(h, oidSPNEGO) {
 		t.Fatal("the SPNEGO OID must be present")
+	}
+	if bytes.Contains(h, oidKrb5) || bytes.Contains(h, oidMSKrb5) {
+		t.Fatalf("Kerberos must not be advertised: % x", h)
 	}
 }
 
@@ -53,24 +54,7 @@ func TestClassifySPNEGOWrappedKerberosAPReq(t *testing.T) {
 		t.Fatal("must classify as SPNEGO-wrapped")
 	}
 	if !bytes.Equal(inc.Token, apReq) {
-		t.Fatal("the token fed to the acceptor must be the GSS AP-REQ")
-	}
-	// And the GSS wrapper must unwrap back to the AP-REQ body.
-	unwrapped, ok := unwrapGSSAPREQ(inc.Token)
-	if !ok {
-		t.Fatal("GSS unwrap failed")
-	}
-	if !bytes.Equal(unwrapped, []byte("ap-req-bytes")) {
-		t.Fatalf("unwrapped = % x", unwrapped)
-	}
-}
-
-func TestUnwrapGSSBareAPReq(t *testing.T) {
-	// A bare AP-REQ (application tag 0x6E) is accepted as-is.
-	bare := append([]byte{0x6E, 0x03}, []byte("abc")...)
-	got, ok := unwrapGSSAPREQ(bare)
-	if !ok || !bytes.Equal(got, bare) {
-		t.Fatalf("bare AP-REQ = % x, %v", got, ok)
+		t.Fatal("the token must be the GSS AP-REQ")
 	}
 }
 
@@ -135,7 +119,6 @@ func TestMalformedBlobsDoNotPanic(t *testing.T) {
 	}
 	for _, b := range blobs {
 		_ = classifyBlob(b)
-		_, _ = unwrapGSSAPREQ(b)
 		_, _ = parseTLV(b)
 	}
 }

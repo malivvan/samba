@@ -21,7 +21,7 @@ were kept as-is rather than "fixed".
 | `src/net.rs` | `netinfo.go` | Interface enumeration and `NETWORK_INTERFACE_INFO` encoding |
 | `src/ntlm.rs` | `ntlm.go` | NTLMv2 + the NTLM-specific SPNEGO helpers |
 | `src/spnego.rs` | `spnego.go` | DER writer/reader, mechanism selection, `NegTokenInit2` hint |
-| `src/krb5.rs` | `krb5.go` | Kerberos acceptor, now pure Go |
+| `src/krb5.rs` | — | Kerberos was ported, then removed: see "Kerberos was removed" below |
 | `src/smb2/mod.rs` | `smb2.go` | Header codec, compound dispatch, transform header, `ProcessFrame` |
 | `src/smb2/handlers.rs` | `handlers.go` | Every command handler |
 | `src/uring.rs` | `server.go`, `notify.go`, `zerocopy.go` | The transport, rewritten (below) |
@@ -66,12 +66,14 @@ in the config format is unchanged, including the TOML key names.
   the SPNEGO wrappers. MD4 (the NT hash), HMAC-MD5 and RC4 come from
   `md4.go` (hand-written, RFC 1320 vectors) plus Go's `crypto/md5` and
   `crypto/rc4`.
-- **Kerberos** no longer calls a system GSS library. `krb5.go` uses a pure-Go
-  Kerberos service implementation: it parses the AP-REQ, validates it against
-  the keytab (ticket decryption, authenticator checks, clock skew, replay
-  cache), and takes the **authenticator sub-session key** — the same value
-  `GSS_C_INQ_SSPI_SESSION_KEY` returns — as the SMB session key. The
-  GSS/SASL wrapper handling (OID, token id, AP-REQ) is the same shape as before.
+- **Kerberos was removed.** It was first ported (pure Go, no system GSS library),
+  and then deleted outright, along with the `jcmturner/gokrb5` dependency: this
+  server is aimed mainly at non-corporate users and at being reachable from the
+  internet, and real Kerberos deployments still lean on RC4-HMAC (etype 23),
+  which has known weaknesses. The reasoning is recorded in
+  [AGENTS.md](../AGENTS.md), and what replaced the shared half of it is
+  `auth.go` — session establishment, which NTLM uses and any future mechanism
+  would too.
 - **AES-CMAC and AES-CCM** are implemented here because Go's standard library
   has neither. Both are validated against the RFC's own test vectors
   (RFC 4493 §6, RFC 3610 §8) and exercised by the fuzz targets. AES-GCM and the
@@ -122,12 +124,10 @@ Everything below is a conscious change, not an accident of translation.
    channels counted, so handles opened on an abruptly closed connection could
    linger. Here, teardown also drops the connection's channels and, when the
    last channel goes, the session and its handles.
-4. **The NEGOTIATE SPNEGO hint follows the `auth` policy.** The original
-   advertised NTLMSSP unconditionally in the mechanism hint, even for a
-   Kerberos-preferred configuration. This port advertises exactly the
-   mechanisms `auth` permits, Kerberos first, which is what the SPNEGO helper
-   was designed to do and avoids offering a mechanism the server would then
-   refuse.
+4. **The NEGOTIATE SPNEGO hint advertises NTLMSSP only.** The original could
+   advertise a Kerberos-preferred list; this server has one mechanism, so the
+   hint names exactly that one. Offering a mechanism the server would then
+   refuse only produces a failed logon.
 5. **`ProcessFrame` reports a "close the connection" outcome explicitly.** The
    original signalled it through a `FrameAction::Close` variant; the Go version
    returns an action value, with the same trigger (an undecryptable encrypted
@@ -177,8 +177,8 @@ Everything below is a conscious change, not an accident of translation.
 - **Authorization is share-level only**, all I/O runs as the server's Unix user,
   and symlinks inside a share are followed even outside it — as in the original
   and as in Samba's `wide links`.
-- **Kerberos is single-leg**, and a multi-leg exchange is rejected with a log
-  line, as before.
+- **Kerberos is gone**: the original handled a single-leg AP-REQ exchange; this
+  server refuses a Kerberos token with `STATUS_NOT_SUPPORTED`.
 
 ## Not migrated
 
@@ -186,6 +186,6 @@ The original repository also carried release engineering and distro submission
 material (distribution packaging plans, a Fedora/Debian submission write-up,
 and a changelog of the Rust project's releases). Those describe that project's
 history and processes rather than this server, so they are not part of this
-package. What is kept: the licence, the security policy, a contributor guide,
-the architecture/benchmark/testing/tuning/lease/Kerberos/FIPS notes and the man
-page, all rewritten for this implementation.
+package. What is kept: the licence, the security policy, the architecture,
+benchmark, testing, tuning, lease and FIPS notes and the man page, all rewritten
+for this implementation.
