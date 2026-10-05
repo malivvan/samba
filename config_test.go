@@ -131,9 +131,16 @@ func TestShippedExampleConfigLoads(t *testing.T) {
 	if err := os.Mkdir(sub, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// The example points at real paths; rewrite them to the temp dir so the
-	// structure, keys and types are what is validated.
-	patched := strings.ReplaceAll(string(raw), `path = "/srv/data"`, `path = "`+sub+`"`)
+	// The example points at a placeholder path; rewrite it to the temp dir so
+	// the structure, keys and types are what is validated. The placeholder has
+	// to stay what this test rewrites, or the file would validate only on a
+	// machine that happens to have that directory — which is how a shipped
+	// example silently becomes unrunnable.
+	const placeholder = `path = "/srv/data"`
+	if !strings.Contains(string(raw), placeholder) {
+		t.Fatalf("samba.toml.example must use the placeholder %s", placeholder)
+	}
+	patched := strings.ReplaceAll(string(raw), placeholder, `path = "`+sub+`"`)
 	cfg, err := ParseConfig([]byte(patched))
 	if err != nil {
 		t.Fatalf("the example config must load: %v", err)

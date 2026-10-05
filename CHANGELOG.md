@@ -6,6 +6,39 @@ conventional commits.
 
 ## [Unreleased]
 
+### Repository layout, CLI and introspection
+
+- **`cmd/samba/` became `cmd/`**, so `go build ./cmd` is the server binary, the
+  usual shape for a single-command module. Every reference was updated: the
+  `bench/` scripts, the systemd/deb/RPM recipes, the man page, the docs, the
+  README and CI.
+- **`SPEC.md` moved to [docs/SAMBA.md](docs/SAMBA.md)** and **`packaging/` was
+  renamed to `pack/`**. `CONTRIBUTING.md` is gone; its file map now lives in
+  `AGENTS.md`, next to the rest of the project context.
+- **The CLI is now a report on the server, not just a launcher.** `--check`
+  validates a configuration and prints the resolved settings, every capability
+  it enables, the shares and the users; `--dump-config` prints the resolved
+  configuration as TOML with every password and NT hash redacted;
+  `--list-dialects`, `--list-ciphers` and `--list-interfaces` print the
+  negotiation facts; `--log-level`, `--listen` and `--workers` override the file;
+  `--help` documents all of it. At `log_level = 1` or above the startup banner
+  logs the same report, so the banner and `--check` cannot disagree.
+- **New introspection API**, which is what the CLI is built on and what
+  operational tooling can use: `Dialects`, `Ciphers`, `SigningAlgorithms`
+  (the negotiation facts), `Srv.Capabilities()` (what a configuration enables),
+  `Server.Stats()` (live connections, sessions, handles, trees and leases),
+  `AdvertisedInterfaces()` (the multichannel advertisement), and the
+  `Registry.Len`/`Registry.Totals`/`LeaseTable.Len` counters underneath.
+  `NEGOTIATE` now takes its cipher preference order from that same list, so what
+  is published is what is applied. `introspect_test.go` pins each published list
+  to the code that consumes it.
+- **`samba.toml.example` is a working, fully commented configuration again.** It
+  had drifted to a developer's own paths and settings, which meant
+  `TestShippedExampleConfigLoads` only passed on a machine that happened to have
+  that directory — on a fresh checkout, and so in CI, it would have failed. The
+  example uses the documented placeholders, and the test now says so explicitly
+  when the placeholder is missing instead of failing obscurely later.
+
 ### Security and stability review
 
 A full review of the package (see [REVIEW.md](REVIEW.md)) found and fixed 22

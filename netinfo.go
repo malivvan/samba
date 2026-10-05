@@ -89,6 +89,28 @@ func EnumerateInterfaces() []Iface {
 	return out
 }
 
+// AdvertisedInterfaces applies the `advertise_only` filter — a list of
+// addresses, empty meaning everything — to the host's interfaces. It is the set
+// the server reports in NEGOTIATE and in FSCTL_QUERY_NETWORK_INTERFACE_INFO,
+// and the CLI prints it for `--list-interfaces`.
+func AdvertisedInterfaces(only []string) []Iface {
+	ifaces := EnumerateInterfaces()
+	if len(only) == 0 {
+		return ifaces
+	}
+	want := make(map[string]bool, len(only))
+	for _, ip := range only {
+		want[ip] = true
+	}
+	kept := ifaces[:0]
+	for _, i := range ifaces {
+		if want[i.Addr.String()] {
+			kept = append(kept, i)
+		}
+	}
+	return kept
+}
+
 // EncodeInterfaceInfo encodes the interface list as a chain of
 // NETWORK_INTERFACE_INFO structures (MS-SMB2 2.2.32.5) for the
 // FSCTL_QUERY_NETWORK_INTERFACE_INFO reply.

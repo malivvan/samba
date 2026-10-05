@@ -30,7 +30,7 @@ command -v kinit >/dev/null || fail "krb5-workstation (kinit) not installed"
 klist -k "$KEYTAB" | grep -q "cifs/$SPN_HOST@$REALM" || fail "keytab lacks cifs/$SPN_HOST@$REALM"
 
 echo "== build =="
-go build -o samba ./cmd/samba
+go build -o samba ./cmd
 
 mkdir -p "$SHARE_DIR" "$MNT"
 cat > "$CFG" <<INI

@@ -1,5 +1,5 @@
 # Static binary in a scratch image. Build with podman or docker:
-#   CGO_ENABLED=0 go build -trimpath -o samba ./cmd/samba
+#   CGO_ENABLED=0 go build -trimpath -o samba ./cmd
 #   podman build -t samba -f Containerfile .
 # Or let the image build itself:
 #   podman build -t samba -f Containerfile --build-arg BUILD=1 .
@@ -12,7 +12,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/samba ./cmd/samba
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/samba ./cmd
 
 FROM scratch
 COPY --from=build /out/samba /usr/bin/samba

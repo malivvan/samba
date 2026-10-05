@@ -23,7 +23,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[ -x "$BIN" ] || { echo "FAIL: binary $BIN not found (go build -o samba ./cmd/samba)"; exit 1; }
+[ -x "$BIN" ] || { echo "FAIL: binary $BIN not found (go build -o samba ./cmd)"; exit 1; }
 command -v smbclient >/dev/null || { echo "FAIL: smbclient not installed"; exit 1; }
 
 ok()   { PASS=$((PASS+1)); echo "  ok   $1"; }

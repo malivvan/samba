@@ -31,7 +31,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Build, test and race-test the whole module — the package and cmd/samba —
+  # Build, test and race-test the whole module — the package and cmd —
   # on each of the three desktop platforms.
   test:
     name: test (${{ matrix.os }})
@@ -173,7 +173,7 @@ jobs:
           sudo apt-get install -y smbclient
       - name: SMB client interop
         run: |
-          CGO_ENABLED=0 go build -trimpath -o ./samba ./cmd/samba
+          CGO_ENABLED=0 go build -trimpath -o ./samba ./cmd
           ./bench/interop-smbclient.sh ./samba
 
   cross-build:
@@ -233,7 +233,7 @@ jobs:
           mkdir -p out
           for arch in amd64 arm64; do
             GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags="-s -w" -o "out/samba-linux-$arch" ./cmd/samba
+              go build -trimpath -ldflags="-s -w" -o "out/samba-linux-$arch" ./cmd
           done
           # The binary is static: there are no library dependencies at all,
           # which is the point of keeping the module CGO-free.

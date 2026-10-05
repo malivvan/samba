@@ -114,20 +114,7 @@ func NewServer(cfg *Config) (*Server, error) {
 	}
 	guid := [16]byte{}
 	randBytes(guid[:])
-	ifaces := EnumerateInterfaces()
-	if len(cfg.AdvertiseOnly) > 0 {
-		want := make(map[string]bool, len(cfg.AdvertiseOnly))
-		for _, ip := range cfg.AdvertiseOnly {
-			want[ip] = true
-		}
-		kept := ifaces[:0]
-		for _, i := range ifaces {
-			if want[i.Addr.String()] {
-				kept = append(kept, i)
-			}
-		}
-		ifaces = kept
-	}
+	ifaces := AdvertisedInterfaces(cfg.AdvertiseOnly)
 	nworkers := cfg.Workers
 	if nworkers <= 0 {
 		nworkers = numCPU()

@@ -469,10 +469,11 @@ func chooseCipher(srv *Srv, msg []byte, off uint32, dataLen int) uint16 {
 		}
 	}
 	if srv.cfg.PreferAES256 {
-		// Server preference: strongest GCM, then CCM.
-		for _, want := range []uint16{CipherAES256GCM, CipherAES256CCM, CipherAES128GCM, CipherAES128CCM} {
-			if containsU16(offered, want) {
-				return want
+		// Server preference: exactly the order Ciphers() publishes, strongest
+		// first, so what --list-ciphers prints is what negotiation applies.
+		for _, want := range ciphers {
+			if containsU16(offered, want.ID) {
+				return want.ID
 			}
 		}
 		return 0

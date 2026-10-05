@@ -101,7 +101,7 @@ like-for-like comparison against Samba, and the tuning findings are there too.
 ## Build
 
 ```sh
-go build ./cmd/samba          # the server binary
+go build ./cmd                # the server binary
 go test ./...                 # unit, protocol and socket-level tests
 go test -race ./...           # the same, under the race detector
 go test -run '^$' -fuzz FuzzProcessFrame -fuzztime 60s .   # fuzz the wire parser
@@ -112,7 +112,7 @@ A static binary is the zero-effort default — that is the point of having no
 CGO:
 
 ```sh
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o samba ./cmd/samba
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o samba ./cmd
 ```
 
 ### Container
@@ -122,17 +122,37 @@ config from `/etc/samba/samba.toml`, so mount that and your share directories
 in, and publish port 445:
 
 ```sh
-CGO_ENABLED=0 go build -trimpath -o samba ./cmd/samba
+CGO_ENABLED=0 go build -trimpath -o samba ./cmd
 podman build -t samba -f Containerfile .
 podman run -d -p 445:445 -v /etc/samba:/etc/samba:ro -v /srv/data:/srv/data samba
 ```
 
 ## Configuration
 
-TOML, passed with `--config <path>` (default `./samba.toml`). `--check`
-validates a file and exits; `--version` prints the version. Unknown keys are
+TOML, passed with `--config <path>` (default `./samba.toml`). Unknown keys are
 rejected, so a typo fails at startup instead of silently taking a default. A
-full example is in [`samba.toml.example`](samba.toml.example).
+full example — every key, commented — is in
+[`samba.toml.example`](samba.toml.example).
+
+The command reports what a configuration will actually do, from the same
+introspection the server itself uses:
+
+```sh
+# validate a file, and report the settings and capabilities it enables
+samba --check --config /etc/samba/samba.toml
+# the resolved configuration, with every credential redacted
+samba --dump-config --config /etc/samba/samba.toml
+# the negotiation facts
+samba --list-dialects
+samba --list-ciphers
+# the multichannel advertisement, after advertise_only
+samba --list-interfaces --config /etc/samba/samba.toml
+# override the file: overrides always win
+samba --log-level 2 --listen 127.0.0.1:4455 --workers 4
+```
+
+At `log_level = 1` or above the same report is logged at startup, so the banner
+and `--check` can never disagree about what a configuration means.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -221,7 +241,13 @@ mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,mu
 entry points are `ProcessFrame` (bytes in, response bytes or a zero-copy read
 plan out), the `Server` type, the configuration model
 (`LoadConfig`/`ParseConfig`), and `EncodeInterfaceInfo` for the multichannel
-interface advertisement. See the package documentation:
+interface advertisement.
+
+For operational tooling there is an introspection API, and the CLI is built
+entirely on it: `Dialects()` and `Ciphers()` report the negotiation facts,
+`Srv.Capabilities()` what a configuration enables, `Server.Stats()` the live
+connection, session, handle, tree and lease counts, and `AdvertisedInterfaces()`
+the multichannel advertisement. See the package documentation:
 
 ```sh
 go doc github.com/malivvan/samba
@@ -232,6 +258,8 @@ go doc github.com/malivvan/samba
 | Document | Contents |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | process/worker/connection layout, the zero-copy read path, batching |
+| [docs/SAMBA.md](docs/SAMBA.md) | the consolidated SAMBA/SMB2-3 specification this server is written against |
+| [ROADMAP.md](ROADMAP.md) | what is not implemented yet, grouped by spec section, with the reason |
 | [docs/TESTING.md](docs/TESTING.md) | unit, integration and socket tests, fuzzing, CI, the host suites |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | benchmark method, measured numbers, tuning findings |
 | [docs/TUNING.md](docs/TUNING.md) | jumbo frames, TCP buffers, NIC/RSS, multichannel |

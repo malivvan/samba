@@ -6,7 +6,7 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 	dh $@
 
 override_dh_auto_build:
-	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o samba ./cmd/samba
+	CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o samba ./cmd
 
 override_dh_auto_test:
 	CGO_ENABLED=0 go test ./... || true
@@ -14,7 +14,7 @@ override_dh_auto_test:
 override_dh_auto_install:
 	install -Dpm0755 samba debian/samba/usr/bin/samba
 	install -Dpm0644 samba.toml.example debian/samba/etc/samba/samba.toml
-	install -Dpm0644 packaging/samba.service debian/samba/lib/systemd/system/samba.service
+	install -Dpm0644 pack/samba.service debian/samba/lib/systemd/system/samba.service
 	install -Dpm0644 docs/samba.8 debian/samba/usr/share/man/man8/samba.8
 	install -Dpm0644 README.md debian/samba/usr/share/doc/samba/README.md
 	install -Dpm0644 SECURITY.md debian/samba/usr/share/doc/samba/SECURITY.md

@@ -9,13 +9,26 @@ document is the method.
 ## Everything at once
 
 ```sh
-go build ./...
+go build ./...                          # the package and cmd
 go vet ./...
 gofmt -l .                              # must print nothing
 go test ./...                           # unit + protocol + socket tests
 go test -race ./...                     # the same, under the race detector
 go test -run '^$' -fuzz FuzzProcessFrame -fuzztime 60s .
 go test -run '^$' -bench . -benchtime 1s .
+```
+
+The CLI is the cheapest gate for anything a client can see: it reports what a
+configuration will advertise without binding anything, so it is worth running
+before the full suite.
+
+```sh
+# what will this configuration actually serve?
+go run ./cmd --check --config /etc/samba/samba.toml
+# the resolved configuration, with every credential redacted
+go run ./cmd --dump-config --config /etc/samba/samba.toml
+# the negotiation facts
+go run ./cmd --list-dialects
 ```
 
 The race detector matters here: the concurrency is real (one goroutine per
@@ -45,6 +58,9 @@ loop, not an occasional extra.
 | `hardening_test.go` | The transport's hardening: the connection cap, incomplete-frame reaping, the zero-copy stall deadline and its correctness, break routing, deferred-frame writing, panic containment, and clean shutdown |
 | `edge_test.go` | The remaining edges: AEAD and CMAC error paths, the CCM length-prefix forms, `clamp`/`isHex`, handle-table misses, the response write stall, and path/metadata variants |
 | `server_test.go` | The same things over a real socket: framing, batched pipelining, the zero-copy read path at several offsets (in a deliberately non-sequential order), IOCTL FSCTLs, a CHANGE_NOTIFY that completes from a real inotify event, **a lease break delivered to the other client**, and rejection of a desynchronized stream |
+| `introspect_test.go` | The introspection contract: the published dialect and cipher lists against the negotiation code that consumes them (names, revision codes, key sizes, preference order), the capability report against a configuration, and the live counters against a real connection |
+| `version_test.go` | `Version` against the newest released `CHANGELOG.md` heading — the drift the release job refuses to publish |
+| `cmd/main_test.go`, `cmd/cli_test.go` | The CLI: exit statuses, `--help` completeness, the `--list-*` reports, that `--dump-config` never prints a credential, that the overrides beat the file, and that the report carries every capability the library publishes with the right state |
 
 ## Coverage
 

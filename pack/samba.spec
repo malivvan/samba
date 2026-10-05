@@ -20,12 +20,12 @@ file pages to the socket through splice(2) without entering userspace.
 %setup -q
 
 %build
-CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o samba ./cmd/samba
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o samba ./cmd
 
 %install
 install -Dpm0755 samba %{buildroot}%{_bindir}/samba
 install -Dpm0644 samba.toml.example %{buildroot}%{_sysconfdir}/samba/samba.toml
-install -Dpm0644 packaging/samba.service %{buildroot}%{_unitdir}/samba.service
+install -Dpm0644 pack/samba.service %{buildroot}%{_unitdir}/samba.service
 install -Dpm0644 docs/samba.8 %{buildroot}%{_mandir}/man8/samba.8
 install -Dpm0644 README.md %{buildroot}%{_docdir}/samba/README.md
 install -Dpm0644 SECURITY.md %{buildroot}%{_docdir}/samba/SECURITY.md

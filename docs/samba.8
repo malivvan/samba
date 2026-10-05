@@ -3,9 +3,17 @@
 samba \- pure-Go SMB2/SMB3 file server (zero-copy reads, multichannel)
 .SH SYNOPSIS
 .B samba
-[\fB\-\-config\fR \fIpath\fR]
+[\fB\-c\fR \fIpath\fR | \fB\-\-config\fR \fIpath\fR]
 [\fB\-\-check\fR]
-[\fB\-\-version\fR]
+[\fB\-\-dump\-config\fR]
+[\fB\-\-list\-dialects\fR]
+[\fB\-\-list\-ciphers\fR]
+[\fB\-\-list\-interfaces\fR]
+[\fB\-\-log\-level\fR \fIn\fR]
+[\fB\-\-listen\fR \fIaddr\fR]
+[\fB\-\-workers\fR \fIn\fR]
+[\fB\-V\fR | \fB\-\-version\fR]
+[\fB\-h\fR | \fB\-\-help\fR]
 .SH DESCRIPTION
 .B samba
 is a from-scratch SMB2/3 file server, an
@@ -27,21 +35,65 @@ with
 .BR splice (2).
 Reads that must be signed or encrypted, and reads inside a compound request,
 take a buffered positional-read path instead.
+.PP
+At \fBlog_level\fR 1 or above the server logs a banner reporting every
+capability it is about to advertise. The same report, from the same source, is
+what
+.B \-\-check
+prints, and the negotiation facts are what the
+.B \-\-list\-\fR
+options print.
 .SH OPTIONS
 .TP
-.BR \-\-config " " \fIpath\fR " (or " \-c ")"
+.BR \-c " " \fIpath\fR ", " \-\-config " " \fIpath\fR
 Path to the TOML configuration file. Default: \fIsamba.toml\fR.
 .TP
 .B \-\-check
-Validate the configuration and exit.
+Validate the configuration and report everything it enables — the resolved
+settings, every capability, the shares and the users — then exit. It builds the
+full server context, so a configuration that cannot start (an unusable keytab, a
+bad bind address, a malformed user database) fails here exactly as it would at
+startup. Nothing is bound.
 .TP
-.BR \-\-version " (or " \-V ")"
+.B \-\-dump\-config
+Print the resolved configuration as TOML, with passwords and NT hashes
+redacted, and exit. Useful in a bug report; it is not a usable config file.
+.TP
+.B \-\-list\-dialects
+Print the SMB dialects this build negotiates, newest first, with the revision
+codes. No configuration is needed.
+.TP
+.B \-\-list\-ciphers
+Print the SMB3 encryption ciphers (strongest first, the order \fBprefer_aes256\fR
+applies) and the signature algorithms. No configuration is needed.
+.TP
+.B \-\-list\-interfaces
+Print the multichannel interface advertisement after the \fBadvertise_only\fR
+filter: the addresses, link speeds and capability bits a client uses to decide
+how many channels to open.
+.TP
+.B \-\-log\-level " " \fIn\fR
+Override \fBlog_level\fR: 0 (warn), 1 (info) or 2 (debug).
+.TP
+.B \-\-listen " " \fIaddr\fR
+Override \fBlisten\fR.
+.TP
+.B \-\-workers " " \fIn\fR
+Override \fBworkers\fR: the number of SO_REUSEPORT listeners, or 0 for one per
+CPU core.
+.TP
+.BR \-V ", " \-\-version
 Print the version and exit.
+.TP
+.BR \-h ", " \-\-help
+Print the usage summary and exit.
+.PP
+The three overrides are applied on top of the configuration file, so they win.
 .SH CONFIGURATION
 Configuration is TOML, by convention \fI/etc/samba/samba.toml\fR. Unknown keys
 are rejected. See
 .I samba.toml.example
-for a fully commented file.
+for a fully commented file with every key.
 .TP
 .B listen
 Bind address, default \fB"0.0.0.0:445"\fR. Binding 445 needs
@@ -83,6 +135,11 @@ every non-loopback interface.
 Grant leases: read-caching, plus handle-caching when the client asks. Default
 true. Write-caching is never granted.
 .TP
+.B max_connections
+Concurrent connections the server will serve, default 512. Each connection
+costs goroutines plus up to one maximum-size request frame of buffered data, so
+this is the main lever on worst-case memory use. \fB\-1\fR removes the limit.
+.TP
 .B auth
 \fB"ntlm"\fR, \fB"kerberos"\fR or \fB"both"\fR (the default; Kerberos is
 preferred with NTLM as fallback).
@@ -95,7 +152,8 @@ the ticket).
 .TP
 .B [[share]]
 At least one is required: \fBname\fR, \fBpath\fR (an existing directory) and
-\fBread_only\fR (default false). The name \fIIPC$\fR is reserved.
+\fBread_only\fR (default false). Authorization is share-level only, so
+\fBread_only\fR applies to every user. The name \fIIPC$\fR is reserved.
 .TP
 .B [[user]]
 \fBname\fR plus exactly one of \fBpassword\fR or \fBnt_hash\fR (32 hex
@@ -107,6 +165,9 @@ Conventional configuration path.
 .TP
 .I samba.toml
 Default when \fB\-\-config\fR is not given.
+.TP
+.I /etc/krb5.keytab
+Fallback keytab for the Kerberos acceptor.
 .SH EXAMPLES
 .PP
 .nf
@@ -124,6 +185,13 @@ name = "alice"
 password = "secret"
 .fi
 .PP
+Check it before starting, and see what it will advertise:
+.PP
+.nf
+samba --check --config /etc/samba/samba.toml
+samba --list-interfaces --config /etc/samba/samba.toml
+.fi
+.PP
 Run it:
 .PP
 .nf
@@ -137,21 +205,37 @@ mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,se
 mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,seal
 mount -t cifs //server/data /mnt -o username=alice,password=secret,vers=3.1.1,multichannel,max_channels=4
 .fi
+.SH SIGNALS
+.TP
+.B SIGINT, SIGTERM
+Stop the server. Listeners close, connections drain, and the workers are waited
+for before the process exits with status 0.
 .SH EXIT STATUS
 .TP
 .B 0
-Clean shutdown.
+Clean shutdown, or a successful reporting command.
 .TP
 .B 2
 A usage error, a configuration error, or a startup failure.
 .SH SECURITY
 Authorization is \fBshare-level only\fR: \fBread_only\fR applies to every user,
-and all file I/O runs as the server's Unix user. Run the server as a dedicated
-unprivileged user that owns only the share trees. No external security review has
-been done; do not expose port 445 to the public internet. See
+and all file I/O runs as the server's Unix user. Role-based access, per-share
+user lists and SID-to-uid mapping are not implemented. Run the server as a
+dedicated unprivileged user that owns only the share trees. Symlinks inside a
+share are followed even when they point outside it, as in Samba's \fBwide
+links\fR. No external security review has been done; do not expose port 445 to
+the public internet. See
 .I SECURITY.md.
 .SH SEE ALSO
 .BR smbd (8),
 .BR mount.cifs (8),
-.BR docs/ARCHITECTURE.md ,
-.BR docs/TUNING.md
+.I README.md
+(build, configuration reference, mounting),
+.I docs/ARCHITECTURE.md
+(the design),
+.I docs/SAMBA.md
+(the protocol specification this server is written against),
+.I docs/TUNING.md
+(sizing and throughput),
+.I ROADMAP.md
+(what is not implemented, and why)

@@ -92,3 +92,30 @@ func (r *Registry) Remove(id uint64) (*Session, bool) {
 	}
 	return s, ok
 }
+
+// Len reports the number of live sessions.
+func (r *Registry) Len() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.byID)
+}
+
+// Totals reports the open handles and connected trees across every session, for
+// diagnostics (Server.Stats). The sessions are copied out under the registry
+// lock and then locked one at a time, so a snapshot never holds the registry
+// lock while waiting on a session that is busy doing file I/O.
+func (r *Registry) Totals() (handles, trees int) {
+	r.mu.Lock()
+	sessions := make([]*Session, 0, len(r.byID))
+	for _, s := range r.byID {
+		sessions = append(sessions, s)
+	}
+	r.mu.Unlock()
+	for _, s := range sessions {
+		s.Lock()
+		handles += s.Handles.Len()
+		trees += len(s.Trees)
+		s.Unlock()
+	}
+	return handles, trees
+}

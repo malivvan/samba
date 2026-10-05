@@ -27,7 +27,7 @@ count that arrived on the wire.
   because `golang.org/x/sys` requires it).
 - **Commands** (there is no Makefile; the Go toolchain is the build system):
   ```sh
-  go build ./...                       # the package and cmd/samba
+  go build ./...                       # the package and cmd
   go vet ./...
   go test ./...                        # unit + protocol + socket tests
   go test -race ./...                  # the same under the race detector
@@ -40,7 +40,7 @@ count that arrived on the wire.
   `jcmturner/gokrb5/v8` (the Kerberos/KDC wire protocol for the acceptor).
   Adding a dependency needs a reason that the standard library cannot satisfy.
 - **How it ships**: `Containerfile` builds a static binary into a `scratch`
-  image; `packaging/` carries the systemd unit and the distro metadata. Ports:
+  image; `pack/` carries the systemd unit and the distro metadata. Ports:
   TCP 445 only — no NetBIOS 139, no RPC, no HTTP health endpoint.
 
 ## Architecture
@@ -66,8 +66,33 @@ Responses, lease breaks and notify completions are all funnelled through the
 driver goroutine (the deferred queue exists for precisely that reason). Anything
 that writes to `conn.nc` from another goroutine is a bug.
 
-Read the file map in [CONTRIBUTING.md](CONTRIBUTING.md) for where each concern
-lives, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) is the full design. The file map,
+for where each concern lives:
+
+| File | Contents |
+|---|---|
+| `doc.go` | package documentation and the version constant |
+| `wire.go` | little-endian wire primitives (Reader/Writer, UTF-16LE) |
+| `smb2.go` | SMB2 header codec, compound dispatch, transform header, `ProcessFrame` |
+| `handlers.go` | command handlers (negotiate, session setup, tree, create, read/write, dir, info, lock, notify, ioctl, leases) |
+| `server.go` | transport: SO_REUSEPORT listeners, per-connection goroutines, zero-copy READ, worker mailboxes |
+| `zerocopy.go` | the splice(2) read path |
+| `notify.go` | inotify watcher backing CHANGE_NOTIFY |
+| `session.go` | cross-connection session registry (multichannel) |
+| `lease.go` | file-keyed lease table and cross-worker break mailbox |
+| `vfs.go` | filesystem layer: path resolution, handle table, metadata |
+| `pattern.go` | DOS wildcard matching for QUERY_DIRECTORY |
+| `crypto.go`, `cmac.go`, `ccm.go`, `md4.go` | signing, KDF and AEAD primitives |
+| `ntlm.go`, `spnego.go`, `krb5.go` | authentication mechanisms |
+| `config.go` | TOML configuration and the resolved server context |
+| `limits.go` | every bound on a client-controllable resource |
+| `introspect.go` | the published capability facts: dialects, ciphers, per-config capabilities, live stats |
+| `netinfo.go` | interface enumeration for multichannel |
+| `status.go`, `log.go` | NTSTATUS codes and logging |
+| `cmd/` | the command-line entry point |
+| `docs/` | architecture, the SAMBA specification, benchmark, testing, tuning and security notes |
+| `bench/` | host scripts: benchmark suite, stress/soak, Kerberos e2e, Windows interop |
+| `pack/` | the systemd unit and the distro metadata |
 
 ## Implemented surface
 
@@ -118,6 +143,12 @@ Not implemented, and each has a reason recorded in `docs/` or `SECURITY.md`:
 - **Document as you go.** Any perf-relevant change gets re-measured with the
   benchmarks and recorded in `docs/BENCHMARKS.md`; architecture changes update
   `docs/ARCHITECTURE.md` in the same change.
+- **Introspection is a contract.** The CLI describes the server from
+  `introspect.go` (`Dialects`, `Ciphers`, `Srv.Capabilities`, `Server.Stats`,
+  `AdvertisedInterfaces`) and never from strings written in `cmd/`. A new
+  dialect, cipher or capability goes in that file, with a test in
+  `introspect_test.go` pinning it to the code that acts on it — otherwise
+  `--check`, the banner and the man page drift apart.
 - **Commit style**: conventional commits (`feat:`, `fix:`, `perf:`, `docs:`,
   `chore:`), one logical change each, with `CHANGELOG.md` updated.
 

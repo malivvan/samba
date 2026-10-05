@@ -8,7 +8,7 @@ reason, not an oversight — [SECURITY.md](SECURITY.md) and
 
 ## Specification conformance
 
-[SPEC.md](SPEC.md) is a consolidated SAMBA specification covering the SMB2/SMB3
+[docs/SAMBA.md](docs/SAMBA.md) is a consolidated SAMBA specification covering the SMB2/SMB3
 protocol *and* the wider Samba 3 suite (daemons, configuration, identity
 mapping, VFS, administration, printing). Everything in it that this server does
 not currently do is listed below as a TODO, grouped by the spec section it comes
@@ -66,7 +66,7 @@ SMB2/SMB3 feature set and is fair game to implement.
 
 ---
 
-## TODO: SMB2/SMB3 protocol gaps (SPEC.md §5–9, §20, Appendix A/B)
+## TODO: SMB2/SMB3 protocol gaps (docs/SAMBA.md §5–9, §20, Appendix A/B)
 
 ### Transport (§5)
 
@@ -137,7 +137,7 @@ SMB2/SMB3 feature set and is fair game to implement.
   client offers explicitly, and record why (we currently pick by our own
   preference order, which happens to put 3.1.1 first).
 
-## TODO: Samba 3 suite gaps (SPEC.md §10–19, §21, Appendices C–E)
+## TODO: Samba 3 suite gaps (docs/SAMBA.md §10–19, §21, Appendices C–E)
 
 ### Daemons and listeners (§10, §19)
 

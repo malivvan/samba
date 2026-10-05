@@ -10,7 +10,7 @@ for a Go program.
 FIPS mode is a build of Go plus a runtime setting, not a server flag:
 
 ```sh
-GOFIPS140=latest go build -trimpath -o samba ./cmd/samba
+GOFIPS140=latest go build -trimpath -o samba ./cmd
 GODEBUG=fips140=on ./samba --config /etc/samba/samba.toml
 ```
 

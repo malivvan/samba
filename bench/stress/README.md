@@ -15,7 +15,7 @@ memory scaling, and mount/teardown storms.
 #      oplocks = true
 #      [[user]]  name = "alice"  password = "testpw123"
 #      [[share]] name = "data"   path = "/srv/stress"
-go build -o samba ./cmd/samba && sudo ./samba --config /etc/samba/samba.toml &
+go build -o samba ./cmd && sudo ./samba --config /etc/samba/samba.toml &
 
 # 2. fire the fleet (needs podman; root, for privileged cifs mounts)
 sudo bench/stress/run-stress.sh 100                 # 100 containers, loopback

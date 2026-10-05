@@ -25,7 +25,7 @@ were kept as-is rather than "fixed".
 | `src/smb2/mod.rs` | `smb2.go` | Header codec, compound dispatch, transform header, `ProcessFrame` |
 | `src/smb2/handlers.rs` | `handlers.go` | Every command handler |
 | `src/uring.rs` | `server.go`, `notify.go`, `zerocopy.go` | The transport, rewritten (below) |
-| `src/main.rs` | `cmd/samba/main.go` | Same flags: `--config`, `--check`, `--version` |
+| `src/main.rs` | `cmd/main.go` | Same core flags (`--config`, `--check`, `--version`), plus `--dump-config`, `--list-dialects`, `--list-ciphers`, `--list-interfaces` and `--log-level`/`--listen`/`--workers` overrides |
 | `src/lib.rs` | `doc.go` | Package documentation and the version constant |
 | `fuzz/fuzz_targets/*` | `fuzz_test.go` | cargo-fuzz → native Go fuzzing (four targets) |
 | `bench/*` | `bench/*` | The same host scripts, adapted to this binary |

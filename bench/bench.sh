@@ -29,7 +29,7 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-[ -x "$BIN" ] || fail "binary $BIN not found (build with: go build -o samba ./cmd/samba)"
+[ -x "$BIN" ] || fail "binary $BIN not found (build with: go build -o samba ./cmd)"
 mkdir -p "$SHARE" "$MNT"
 ss -tlnp | grep -q ':445 ' && fail "port 445 busy"
 

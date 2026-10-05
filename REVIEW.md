@@ -406,7 +406,7 @@ parts of the server that had none: every command and its parameter validation
 (`auth_test.go`), a complete Kerberos login built from a real keytab and AP-REQ
 (`krb5_test.go`), the notifier and its inotify parsing (`notify_test.go`), the
 resource limits (`limits_test.go`, `caps_test.go`), the reconnect/panic/timeout
-paths (`hardening_test.go`) and the CLI (`cmd/samba/main_test.go`).
+paths (`hardening_test.go`) and the CLI (`cmd/main_test.go`).
 
 Package statement coverage went from 68% to **94%** while doing so, which is a
 side effect rather than the goal: the tests were written to assert behaviour a

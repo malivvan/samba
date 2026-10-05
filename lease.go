@@ -63,6 +63,13 @@ type LeaseTable struct {
 // NewLeaseTable returns an empty lease registry.
 func NewLeaseTable() *LeaseTable { return &LeaseTable{m: make(map[fileKey][]LeaseGrant)} }
 
+// Len reports the number of leases currently granted, across every file.
+func (t *LeaseTable) Len() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.count
+}
+
 // Grant grants (or refreshes) a lease for g.LeaseKey on a file. There is one
 // lease per (file, lease key): a re-open with the same key replaces the prior
 // grant.
