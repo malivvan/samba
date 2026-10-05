@@ -404,7 +404,10 @@ func (c *conn) serve() {
 	go c.readLoop()
 
 	tx := NewWriter(4096)
-	var pending *ZcReadPlan
+	var (
+		zc      *ZcReadPlan
+		backlog [][]byte
+	)
 	for {
 		// Flush buffered responses, then any queued server-initiated frames.
 		if tx.Len() > 0 {
@@ -413,67 +416,86 @@ func (c *conn) serve() {
 			}
 			tx.Truncate(0)
 		}
-		if pending != nil {
-			if !c.sendRead(pending) {
+		if zc != nil {
+			if !c.sendRead(zc) {
 				return
 			}
-			pending = nil
+			zc = nil
 			continue
 		}
 		if !c.flushDeferred() {
 			return
 		}
-		select {
-		case f, ok := <-c.frames:
-			if !ok {
+		if len(backlog) == 0 {
+			select {
+			case f, ok := <-c.frames:
+				if !ok {
+					return
+				}
+				backlog = append(backlog, f)
+				backlog = c.drainFrames(backlog)
+			case <-c.deferred.signal:
+				continue
+			case <-c.done:
 				return
 			}
-			plan, keep := c.processBatch(f, tx)
-			if !keep {
-				return
-			}
-			pending = plan
-		case <-c.deferred.signal:
-			// Loop around to drain; nothing else to do.
-		case <-c.done:
+		}
+		var closeConn bool
+		backlog, zc, closeConn = c.processBacklog(backlog, tx)
+		if closeConn {
 			return
 		}
 	}
 }
 
-// processBatch processes the first frame plus any coalesced frames already
-// waiting, batching their responses into tx. It stops early when a frame
-// requires a zero-copy reply or a batch flush.
-func (c *conn) processBatch(first []byte, tx *Writer) (*ZcReadPlan, bool) {
-	frames := [][]byte{first}
-loop:
-	for len(frames) < maxBatchFrames {
+// drainFrames takes whatever further frames are already waiting, up to a batch.
+func (c *conn) drainFrames(into [][]byte) [][]byte {
+	for len(into) < maxBatchFrames {
 		select {
 		case f, ok := <-c.frames:
 			if !ok {
-				break loop
+				return into
 			}
-			frames = append(frames, f)
+			into = append(into, f)
 		default:
-			break loop
+			return into
 		}
 	}
-	for _, f := range frames {
-		act, plan := ProcessFrame(c.srv, c.pc, f, tx)
+	return into
+}
+
+// processBacklog processes up to a batch of queued frames into tx. It stops at
+// a zero-copy read plan (which the transport serves next) or when the response
+// batch reaches the flush watermark. Either way the frames it did not process
+// are returned to the caller: a client is waiting for a response to every frame
+// it sent, so dropping the rest of a batch would stall it until it timed out.
+func (c *conn) processBacklog(backlog [][]byte, tx *Writer) ([][]byte, *ZcReadPlan, bool) {
+	n := 0
+	for n < len(backlog) && n < maxBatchFrames {
+		act, plan := ProcessFrame(c.srv, c.pc, backlog[n], tx)
+		n++
 		c.serviceNotify()
 		switch act {
 		case actionClose:
 			// An undecryptable encrypted frame (e.g. guest + seal):
 			// disconnect rather than leave the client hanging.
-			return nil, false
+			return nil, nil, true
 		case actionZcRead:
-			return plan, true
+			return dropFrames(backlog, n), plan, false
 		}
 		if tx.Len() >= txFlush {
 			break
 		}
 	}
-	return nil, true
+	return dropFrames(backlog, n), nil, false
+}
+
+// dropFrames removes the first n frames from backlog, reusing its storage.
+func dropFrames(backlog [][]byte, n int) [][]byte {
+	if n >= len(backlog) {
+		return backlog[:0]
+	}
+	return append(backlog[:0], backlog[n:]...)
 }
 
 // serviceNotify hands the protocol layer's notify queues to the watcher.

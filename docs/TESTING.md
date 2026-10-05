@@ -68,6 +68,7 @@ Windows.
 
 | Script | What it does |
 |---|---|
+| `bench/interop-smbclient.sh` | Drives a running server with Samba's `smbclient` (no root needed): the dialect matrix from SMB 2.0.2 to 3.1.1, md5-verified 20 MiB round trips, mkdir/rename/delete, NTLMv2 with signing enforced, wrong-password rejection, and SMB3 encryption. |
 | `bench/bench.sh` | Full local suite: start the server on a scratch config, cifs-mount it, run sequential read, sequential write, parallel read, small-file metadata and integrity checks, print a block for BENCHMARKS.md, clean up. Also the place to measure a Samba baseline for comparison. |
 | `bench/loopback-multichannel.sh` | Guest and authenticated multichannel on loopback with integrity verification. |
 | `bench/cross-vm-read.sh` | Mount over a real NIC, drop the client cache, run parallel readers on distinct files so the traffic is genuinely on the wire. |
@@ -78,6 +79,43 @@ Windows.
 | `bench/win-multistream.ps1` | Windows concurrent multi-stream read and write. |
 | `bench/krb5/e2e.sh` | `sec=krb5` end to end against a live KDC (see [KERBEROS.md](KERBEROS.md)). |
 | `bench/stress/` | Concurrent-mount stress and a long soak, with a CSV artifact and an analyzer for leak verdicts. |
+
+## Interop with a real client
+
+`bench/interop-smbclient.sh` runs Samba's client against the server and checks
+the outcome rather than the log, so it is a genuine interop gate. On the
+development host it passes 13/13: every dialect from SMB 2.0.2 through 3.1.1
+(negotiating 3.1.1 with AES-128-GCM when offered), a 20 MiB upload+download
+verified by md5, small-file transfers, mkdir/rename/delete with the share left
+clean, NTLMv2 authentication with `require_signing = true`, a wrong password
+rejected with `NT_STATUS_LOGON_FAILURE`, and — with `encrypt = true` on the
+server — a sealed 20 MiB round trip through AES-128-GCM.
+
+That suite is the reason several bugs are not in this port. Driving the protocol
+from unit tests alone had hidden them:
+
+- **Pipelined reads were dropped.** When a batch of frames contained a read that
+  qualified for the zero-copy path, the frames after it were discarded instead
+  of being held for the next turn. `smbclient` — which keeps several reads in
+  flight — reported `parallel_read returned NT_STATUS_IO_TIMEOUT`.
+  `TestServerPipelinedZeroCopyReads` and `TestServerPipelinedMixedBatch` now
+  pipeline reads (and mixed reads and echoes) into one write and require a
+  response to every one; reverting the fix makes them fail with the same timeout
+  the real client saw.
+- **Encryption was advisory, not enforced.** A session told to seal would still
+  be served a plaintext request. It is now refused, and a sealed request on the
+  same session is served and answered with a sealed response — asserted end to
+  end with independently derived keys in
+  `TestEncryptRequiredRejectsPlaintextAndServesSealed`.
+- **Samba's client could not enable encryption at all.** Its NTLMSSP client
+  requires the server to echo `NEGOTIATE_SEAL` before it will turn sealing on;
+  the challenge now echoes it when asked.
+- **Wildcard directory searches returned nothing.** The search pattern a client
+  sends with QUERY_DIRECTORY was compared for equality, so `ls f1*.txt` and
+  `del *` answered `NT_STATUS_NO_SUCH_FILE`. Patterns are now matched as DOS
+  wildcards (`pattern.go`, with a table-driven unit test), and the interop suite
+  lists by wildcard and checks that an unmatched pattern still reports no such
+  file.
 
 ## Test log — what each round found
 

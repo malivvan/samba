@@ -659,3 +659,165 @@ func TestServerRejectsBadFraming(t *testing.T) {
 		t.Fatal("the server must close a desynchronized connection")
 	}
 }
+
+// TestServerPipelinedZeroCopyReads pipelines several large reads into one write
+// and requires a response for every one of them. A zero-copy read defers the
+// rest of its batch until the splice completes, so this is exactly the case
+// where a frame could be dropped — which a real client sees as a read timeout.
+func TestServerPipelinedZeroCopyReads(t *testing.T) {
+	dir := t.TempDir()
+	const chunk = 64 * 1024
+	const n = 6
+	payload := make([]byte, chunk*n)
+	for i := range payload {
+		payload[i] = byte(i * 17)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pipelined.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := startTestServer(t, dir, nil)
+	c := dialTestClient(t, srv.Addr().String())
+	c.establish(0x0302)
+
+	st, fid := c.create("pipelined.bin", fileOpen, 0x40, 0x8000_0000, nil)
+	if st != StatusSuccess {
+		t.Fatalf("create status %#x", st)
+	}
+	defer c.close(fid)
+
+	// Build n READ requests (larger than the zero-copy threshold) and send them
+	// in a single write, as a pipelining client does.
+	var buf []byte
+	offsets := make([]int, n)
+	for i := range n {
+		offsets[i] = i * chunk
+		req := reqHdr(CmdRead, c.nextID(), c.tree, c.sess)
+		req.U16(49)
+		req.U8(0)
+		req.U8(0)
+		req.U32(chunk)
+		req.U64(uint64(offsets[i]))
+		req.U64(fid)
+		req.U64(fid)
+		req.U32(0)
+		req.U32(0)
+		req.U32(0)
+		req.U16(0)
+		req.U16(0)
+		req.U8(0)
+		body := req.Bytes()
+		var nbt [4]byte
+		nbt[1] = byte(len(body) >> 16)
+		nbt[2] = byte(len(body) >> 8)
+		nbt[3] = byte(len(body))
+		buf = append(buf, nbt[:]...)
+		buf = append(buf, body...)
+	}
+	if _, err := c.conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.conn.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// Every request must be answered, in order, with its own payload.
+	for i := range n {
+		r := c.readResp()
+		if r.status != StatusSuccess {
+			t.Fatalf("response %d status %#x", i, r.status)
+		}
+		dlen := int(le32(r.body[4:8]))
+		if dlen != chunk {
+			t.Fatalf("response %d carried %d bytes, want %d", i, dlen, chunk)
+		}
+		got := r.body[16 : 16+dlen]
+		want := payload[offsets[i] : offsets[i]+chunk]
+		if string(got) != string(want) {
+			t.Fatalf("response %d payload mismatch", i)
+		}
+	}
+}
+
+// TestServerPipelinedMixedBatch mixes small buffered requests with zero-copy
+// reads in one write, so the batch is split around the splice and every frame
+// must still be answered exactly once.
+func TestServerPipelinedMixedBatch(t *testing.T) {
+	dir := t.TempDir()
+	const chunk = 32 * 1024
+	payload := make([]byte, chunk*4)
+	for i := range payload {
+		payload[i] = byte(i)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "mixed.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	srv := startTestServer(t, dir, nil)
+	c := dialTestClient(t, srv.Addr().String())
+	c.establish(0x0302)
+
+	st, fid := c.create("mixed.bin", fileOpen, 0x40, 0x8000_0000, nil)
+	if st != StatusSuccess {
+		t.Fatalf("create status %#x", st)
+	}
+	defer c.close(fid)
+
+	// A large read, an ECHO, another large read, an ECHO.
+	frame := func(w *Writer) []byte {
+		body := w.Bytes()
+		var nbt [4]byte
+		nbt[1] = byte(len(body) >> 16)
+		nbt[2] = byte(len(body) >> 8)
+		nbt[3] = byte(len(body))
+		return append(nbt[:], body...)
+	}
+	readAt := func(off int) []byte {
+		req := reqHdr(CmdRead, c.nextID(), c.tree, c.sess)
+		req.U16(49)
+		req.U8(0)
+		req.U8(0)
+		req.U32(chunk)
+		req.U64(uint64(off))
+		req.U64(fid)
+		req.U64(fid)
+		req.U32(0)
+		req.U32(0)
+		req.U32(0)
+		req.U16(0)
+		req.U16(0)
+		req.U8(0)
+		return frame(req)
+	}
+	echo := func() []byte {
+		req := reqHdr(CmdEcho, c.nextID(), c.tree, c.sess)
+		req.U16(4)
+		req.U16(0)
+		return frame(req)
+	}
+	var buf []byte
+	buf = append(buf, readAt(0)...)
+	buf = append(buf, echo()...)
+	buf = append(buf, readAt(chunk)...)
+	buf = append(buf, echo()...)
+	if _, err := c.conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.conn.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for i, wantCmd := range []uint16{CmdRead, CmdEcho, CmdRead, CmdEcho} {
+		r := c.readResp()
+		if r.status != StatusSuccess {
+			t.Fatalf("response %d status %#x", i, r.status)
+		}
+		switch wantCmd {
+		case CmdRead:
+			dlen := int(le32(r.body[4:8]))
+			if dlen != chunk {
+				t.Fatalf("read %d carried %d bytes", i, dlen)
+			}
+		case CmdEcho:
+			if len(r.body) < 4 || le16(r.body[0:2]) != 4 {
+				t.Fatalf("echo %d body = % x", i, r.body)
+			}
+		}
+	}
+}

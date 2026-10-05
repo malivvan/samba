@@ -321,10 +321,9 @@ func dirSnapshot(of *OpenFile, pattern string) ([]DirEnt, error) {
 		out = append(out, DirEnt{Name: name, Meta: meta})
 	}
 	if pattern != "" && pattern != "*" {
-		pl := strings.ToLower(pattern)
 		filtered := out[:0]
 		for _, e := range out {
-			if strings.ToLower(e.Name) == pl {
+			if matchPattern(pattern, e.Name) {
 				filtered = append(filtered, e)
 			}
 		}

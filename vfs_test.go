@@ -140,3 +140,106 @@ func TestStatusFromErrno(t *testing.T) {
 		t.Errorf("statusFromErr(nil) = %#x", got)
 	}
 }
+
+func TestMatchPattern(t *testing.T) {
+	cases := []struct {
+		pattern, name string
+		want          bool
+	}{
+		// Exact, case-insensitive.
+		{"a.txt", "a.txt", true},
+		{"A.TXT", "a.txt", true},
+		{"a.txt", "b.txt", false},
+		// `*` matches any run, including empty and across the dot.
+		{"*", "anything", true},
+		{"*", ".hidden", true},
+		{"*.txt", "a.txt", true},
+		{"*.txt", "a.md", false},
+		{"*.txt", ".txt", true},
+		{"f1*", "f1.txt", true},
+		{"f1*.txt", "f10.txt", true},
+		{"f1*.txt", "f1.txt", true},
+		{"f1*.txt", "f2.txt", false},
+		{"f*1.txt", "f1.txt", true},
+		{"f*1.txt", "f001.txt", true},
+		{"*a*", "banana", true},
+		{"*a*b*c*", "xaybzc", true},
+		{"*z", "banana", false},
+		// `?` matches exactly one character.
+		{"f?.txt", "f1.txt", true},
+		{"f?.txt", "f10.txt", false},
+		{"???", "abc", true},
+		{"???", "ab", false},
+		// A trailing dot is not significant (DOS).
+		{"*", "noext", true},
+		{"*.", "noext", true},
+		{"f*", "file.txt", true},
+		// Consecutive stars behave.
+		{"**", "anything", true},
+		{"a**b", "ab", true},
+		{"a**b", "axxxb", true},
+		// Non-ASCII names match rune-wise.
+		{"*.tö", "grüße.tö", true},
+		{"gr??e.*", "grüße.tö", true},
+	}
+	for _, c := range cases {
+		if got := matchPattern(c.pattern, c.name); got != c.want {
+			t.Errorf("matchPattern(%q, %q) = %t, want %t", c.pattern, c.name, got, c.want)
+		}
+	}
+}
+
+func TestDirSnapshotWildcards(t *testing.T) {
+	dir := t.TempDir()
+	for _, n := range []string{"a.txt", "b.txt", "c.md", "notes", ".hidden"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	of := &OpenFile{File: f, Path: dir, IsDir: true}
+
+	names := func(pattern string) []string {
+		t.Helper()
+		ents, err := dirSnapshot(of, pattern)
+		if err != nil {
+			t.Fatalf("snapshot(%q): %v", pattern, err)
+		}
+		var out []string
+		for _, e := range ents {
+			out = append(out, e.Name)
+		}
+		return out
+	}
+	// The unfiltered listing carries `.` and `..`.
+	if got := names("*"); len(got) != 7 { // ., .., and the five files
+		t.Fatalf("* = %v", got)
+	}
+	// A narrower pattern keeps only what matches — `.` and `..` included, which
+	// is the same rule Windows applies.
+	if got := names("*.txt"); len(got) != 2 || got[0] != "a.txt" || got[1] != "b.txt" {
+		t.Fatalf("*.txt = %v", got)
+	}
+	if got := names("*.TXT"); len(got) != 2 {
+		t.Fatalf("*.TXT (case-insensitive) = %v", got)
+	}
+	if got := names("?.md"); len(got) != 1 || got[0] != "c.md" {
+		t.Fatalf("?.md = %v", got)
+	}
+	if got := names("a.txt"); len(got) != 1 || got[0] != "a.txt" {
+		t.Fatalf("exact name = %v", got)
+	}
+	if got := names("n*"); len(got) != 1 || got[0] != "notes" {
+		t.Fatalf("n* = %v", got)
+	}
+	if got := names("*hidden"); len(got) != 1 || got[0] != ".hidden" {
+		t.Fatalf("*hidden = %v", got)
+	}
+	if got := names("nope*"); len(got) != 0 {
+		t.Fatalf("no match = %v", got)
+	}
+}

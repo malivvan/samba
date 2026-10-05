@@ -78,8 +78,10 @@ type connID struct {
 }
 
 // dispatch routes one SMB2 command to its handler. It returns a non-nil plan
-// when the transport must serve the response zero-copy.
-func dispatch(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Chain, tx *Writer) *ZcReadPlan {
+// when the transport must serve the response zero-copy. sealed reports whether
+// these messages arrived inside an SMB3 transform (so they are already
+// integrity-protected and must not be rejected for being unencrypted).
+func dispatch(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Chain, tx *Writer, sealed bool) *ZcReadPlan {
 	body := msg[64:]
 
 	// Resolve the effective session/tree for related compound operations.
@@ -106,9 +108,21 @@ func dispatch(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Chain, tx *
 	hdr.Credits = grant
 	h = &hdr
 
+	// A session that must encrypt rejects any request that did not arrive
+	// sealed. The server told the client to seal (SESSION_FLAG_ENCRYPT_DATA, or
+	// the client turned sealing on itself), so honoring a plaintext request
+	// would let an attacker strip encryption from the session — which is
+	// precisely what SMB3 encryption exists to prevent.
+	if ch := pc.Channel(chain.SessionID); ch != nil && ch.Encrypt && !sealed &&
+		h.Command != CmdNegotiate && h.Command != CmdSessionSetup && h.Command != CmdCancel {
+		LogWarn("session %x: unencrypted %s on an encryption-required session", chain.SessionID, cmdName(h.Command))
+		errResp(tx, h, StatusAccessDenied, chain)
+		return nil
+	}
+
 	// Verify signatures on signed requests, and reject unsigned requests on
 	// signing-required channels. Signing state is connection-local. This is
-	// skipped entirely for encrypted sessions: an SMB3-encrypted message is not
+	// skipped for encrypted sessions: an SMB3-encrypted message is not
 	// separately signed (the AEAD tag provides integrity, verified at decrypt).
 	if ch := pc.Channel(chain.SessionID); ch != nil && !ch.Encrypt && ch.Sign != nil {
 		if h.Flags&FlagSigned != 0 {
@@ -647,7 +661,7 @@ func ntlmSessionSetup(srv *Srv, pc *ProtoConn, h *ReqHdr, msg []byte, chain *Cha
 		}
 		pc.Channels[sid] = ch
 
-		token := ntlmChallenge(srv.cfg.ServerName, ch.Pending.Challenge)
+		token := ntlmChallenge(srv.cfg.ServerName, ch.Pending.Challenge, ntlmNegotiateFlags(blob))
 		if spnego {
 			token = spnegoWrapChallenge(token)
 		}

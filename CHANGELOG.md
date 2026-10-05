@@ -33,8 +33,11 @@ it is verified against, at that server's 1.4 feature level, with no CGO and no
   pages to the socket through `splice(2)` at an explicit file offset.
 - **Tests**: the full unit and protocol suite, socket-level end-to-end tests
   (pipelining, zero-copy reads at several offsets, IOCTL, change notification, a
-  real lease break, framing rejection), four native Go fuzz targets, and
-  in-repository benchmarks.
+  real lease break, framing rejection, the encrypted request path with
+  independently derived keys), four native Go fuzz targets, in-repository
+  benchmarks, and `bench/interop-smbclient.sh`, which drives the server with
+  Samba's `smbclient` across the dialect matrix, file operations,
+  authentication and SMB3 encryption.
 - **Docs**: a README, project instructions for agents (`AGENTS.md`), and notes
   on architecture, testing, benchmarks, tuning, leases, Kerberos, FIPS 140-3
   mode, concurrency and the port itself, plus a man page.
@@ -52,10 +55,24 @@ it is verified against, at that server's 1.4 feature level, with no CGO and no
   library has none of them) and validated against the RFC test vectors.
 - The OpenSSL/FIPS crypto backend has no equivalent here; FIPS 140-3 mode is
   documented in terms of Go's native validated module instead.
-- Two correctness fixes: sealed responses are appended to the response batch
-  rather than written over it, and zero-copy reads use an explicit file offset so
-  a handle's own position is never disturbed. See `docs/PORTING.md` for the full
-  list of divergences.
+- Correctness and hardening fixes found while porting and while testing against
+  a real client:
+  - sealed responses are appended to the response batch rather than written over
+    it, so pipelined encrypted requests are all answered;
+  - zero-copy reads use an explicit file offset, so a handle's own position is
+    never disturbed (the naive form of the copy walked past EOF after enough
+    reads);
+  - the rest of a request batch is no longer dropped when one of its frames
+    needs a zero-copy reply, which is what made a real client report read
+    timeouts;
+  - a session that requires encryption refuses requests that arrive unsealed
+    instead of serving them in the clear;
+  - the NTLMSSP challenge echoes `NEGOTIATE_SEAL` when the client asks for it,
+    which is what lets Samba's client enable SMB3 encryption;
+  - directory search patterns are matched as DOS wildcards (`?`, `*`,
+    case-insensitive) instead of compared for equality, so `ls *.txt`, `del *`
+    and the like work from real clients instead of reporting no such file.
+  See `docs/PORTING.md` for the full list of divergences.
 
 ### Not implemented
 

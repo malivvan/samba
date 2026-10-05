@@ -23,7 +23,7 @@ func TestClassifyRawAndWrapped(t *testing.T) {
 }
 
 func TestChallengeShape(t *testing.T) {
-	c := ntlmChallenge("SRV", [8]byte{7, 7, 7, 7, 7, 7, 7, 7})
+	c := ntlmChallenge("SRV", [8]byte{7, 7, 7, 7, 7, 7, 7, 7}, 0)
 	if !bytes.Equal(c[:8], ntlmSig) {
 		t.Fatalf("signature = % x", c[:8])
 	}
@@ -198,5 +198,49 @@ func TestSPNEGODERShapes(t *testing.T) {
 	}
 	if !bytes.Equal(done, negResp(acceptCompleted, mechUnknown, nil)) {
 		t.Fatal("accept-completed must match the generic NegTokenResp")
+	}
+}
+
+func TestChallengeEchoesSealOnlyWhenRequested(t *testing.T) {
+	chal := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+	// A plain client gets the baseline flags, without NEGOTIATE_SEAL.
+	base := ntlmChallenge("SRV", chal, 0)
+	if flags := le32(base[20:24]); flags&ntlmFlagSeal != 0 {
+		t.Fatalf("SEAL must not be offered unasked: %#x", flags)
+	}
+	if flags := le32(base[20:24]); flags&0x0000_0010 == 0 {
+		t.Fatalf("SIGN must always be offered (cifs needs it): %#x", flags)
+	}
+	// A client that asks for sealing gets it echoed, which is what makes
+	// Samba's client willing to turn on SMB3 encryption.
+	asked := ntlmChallenge("SRV", chal, ntlmFlagSeal|0x0000_0001)
+	flags := le32(asked[20:24])
+	if flags&ntlmFlagSeal == 0 {
+		t.Fatalf("SEAL must be echoed when requested: %#x", flags)
+	}
+	if flags&ntlmFlagKeyExch == 0 || flags&0x0000_0200 == 0 {
+		t.Fatalf("the baseline flags must survive: %#x", flags)
+	}
+}
+
+func TestNTLMNegotiateFlags(t *testing.T) {
+	// A synthesized type-1 message carrying SEAL.
+	w := NewWriter(0)
+	w.Bytes8(ntlmSig)
+	w.U32(1)
+	w.U32(ntlmFlagSeal | 0x0000_0001)
+	if got := ntlmNegotiateFlags(w.Bytes()); got&ntlmFlagSeal == 0 {
+		t.Fatalf("flags = %#x, want SEAL set", got)
+	}
+	if got := ntlmNegotiateFlags([]byte("garbage")); got != 0 {
+		t.Fatalf("a non-NTLMSSP blob must report 0 flags, got %#x", got)
+	}
+	// A type-3 message has no NegotiateFlags at that offset and must report 0.
+	w = NewWriter(0)
+	w.Bytes8(ntlmSig)
+	w.U32(3)
+	w.U32(ntlmFlagSeal)
+	if got := ntlmNegotiateFlags(w.Bytes()); got != 0 {
+		t.Fatalf("a type-3 message must report 0 flags, got %#x", got)
 	}
 }

@@ -816,3 +816,203 @@ func TestOpenShareRootAndEchoRoundtrip(t *testing.T) {
 		t.Fatalf("echo body = % x", r.body)
 	}
 }
+
+// TestEncryptRequiredRejectsPlaintextAndServesSealed drives the whole encrypted
+// request path with independently derived keys: the server requires encryption,
+// so a plaintext request must be refused and a properly sealed one must be
+// served (with a sealed response).
+func TestEncryptRequiredRejectsPlaintextAndServesSealed(t *testing.T) {
+	dir := t.TempDir()
+	srv := testSrv(t, dir, []UserCfg{{Name: "u", Password: "pw"}})
+	srv.cfg.Encrypt = true
+	pc := NewProtoConn(srv, 0, 0, 1)
+
+	// --- NEGOTIATE 3.1.1 with preauth + encryption capabilities ---
+	neg := reqHdr(CmdNegotiate, 0, 0, 0)
+	negBody := neg.Len()
+	neg.U16(36)
+	neg.U16(1) // one dialect
+	neg.U16(1) // signing enabled
+	neg.U16(0)
+	neg.U32(0)
+	neg.Zeros(16)
+	ncoffPos := neg.Len()
+	neg.U32(0)
+	neg.U16(2) // two negotiate contexts
+	neg.U16(0)
+	neg.U16(0x0311)
+	for (neg.Len()-negBody)%8 != 0 {
+		neg.U16(0)
+	}
+	ctxOff := neg.Len()
+	// PREAUTH_INTEGRITY_CAPABILITIES
+	neg.U16(1)
+	neg.U16(38)
+	neg.U32(0)
+	neg.U16(1)
+	neg.U16(32)
+	neg.U16(1) // SHA-512
+	neg.Zeros(32)
+	neg.Pad8(0) // 8-align the next context from the frame start
+	// ENCRYPTION_CAPABILITIES
+	neg.U16(2)
+	neg.U16(4)
+	neg.U32(0)
+	neg.U16(1) // one cipher
+	neg.U16(CipherAES128GCM)
+	negBytes := neg.Bytes()
+	put32(negBytes[ncoffPos:ncoffPos+4], uint32(ctxOff))
+
+	tx := NewWriter(0)
+	if act, _ := ProcessFrame(srv, pc, negBytes, tx); act != actionRespond {
+		t.Fatal("negotiate must respond")
+	}
+	negResp := append([]byte{}, tx.Bytes()[4:]...)
+	if dialect := le16(negResp[68:70]); dialect != 0x0311 {
+		t.Fatalf("dialect = %#x", dialect)
+	}
+	if pc.Cipher != CipherAES128GCM {
+		t.Fatalf("negotiated cipher = %#x, want AES-128-GCM", pc.Cipher)
+	}
+
+	var zero [64]byte
+	h1 := sha512Parts(zero[:], negBytes)
+	preauth := sha512Parts(h1[:], negResp)
+
+	// --- SESSION_SETUP type 1 (as a real client, asking for sealing) ---
+	blob := append([]byte{}, ntlmSig...)
+	blob = append(blob, 1, 0, 0, 0)
+	blob = append(blob, make([]byte, 8)...) // NegotiateFlags: SEAL
+	put32(blob[12:16], ntlmFlagSeal|0x0000_0010|0x0000_0001)
+	ss1 := reqHdr(CmdSessionSetup, 1, 0, 0)
+	ss1.U16(25)
+	ss1.U8(0)
+	ss1.U8(2) // the client requires signing
+	ss1.U32(0)
+	ss1.U32(0)
+	ss1.U16(88)
+	ss1.U16(uint16(len(blob)))
+	ss1.U64(0)
+	ss1.Bytes8(blob)
+	ss1Bytes := ss1.Bytes()
+
+	tx = NewWriter(0)
+	ProcessFrame(srv, pc, ss1Bytes, tx)
+	ss1Resp := append([]byte{}, tx.Bytes()[4:]...)
+	sess := le64(ss1Resp[40:48])
+	preauth = sha512Parts(preauth[:], ss1Bytes)
+	preauth = sha512Parts(preauth[:], ss1Resp)
+	chal := extractChallenge(t, ss1Resp)
+	// The challenge must echo the SEAL flag the client asked for. The token sits
+	// inside the response security buffer, possibly SPNEGO-wrapped, so locate it.
+	{
+		idx := bytes.LastIndex(ss1Resp, ntlmSig)
+		if idx < 0 {
+			t.Fatal("no NTLMSSP challenge in the response")
+		}
+		flags := le32(ss1Resp[idx+20 : idx+24])
+		if flags&ntlmFlagSeal == 0 {
+			t.Fatalf("challenge must echo NEGOTIATE_SEAL, got %#x", flags)
+		}
+	}
+
+	// --- SESSION_SETUP type 3 ---
+	nt := ntHash("pw")
+	id := append(UTF16LE("U"), UTF16LE("")...)
+	v2 := hmacMD5(nt[:], id)
+	temp := []byte{1, 1, 0, 0, 0, 0, 0, 0}
+	temp = append(temp, make([]byte, 8)...)
+	temp = append(temp, bytes.Repeat([]byte{0x51}, 8)...)
+	temp = append(temp, make([]byte, 8)...)
+	pb := append([]byte{}, chal[:]...)
+	pb = append(pb, temp...)
+	proof := hmacMD5(v2[:], pb)
+	ntResp := append([]byte{}, proof[:]...)
+	ntResp = append(ntResp, temp...)
+	sessionKey := hmacMD5(v2[:], proof[:])
+
+	user16 := UTF16LE("u")
+	t3 := NewWriter(0)
+	t3.Bytes8(ntlmSig)
+	t3.U32(3)
+	off := 64
+	for _, l := range []int{0, len(ntResp), 0, len(user16), 0, 0} {
+		t3.U16(uint16(l))
+		t3.U16(uint16(l))
+		t3.U32(uint32(off))
+		off += l
+	}
+	t3.U32(0) // no KEY_EXCH
+	t3.Bytes8(ntResp)
+	t3.Bytes8(user16)
+
+	ss3 := reqHdr(CmdSessionSetup, 2, 0, sess)
+	ss3.U16(25)
+	ss3.U8(0)
+	ss3.U8(2)
+	ss3.U32(0)
+	ss3.U32(0)
+	ss3.U16(88)
+	ss3.U16(uint16(len(t3.Bytes())))
+	ss3.U64(0)
+	ss3.Bytes8(t3.Bytes())
+	ss3Bytes := ss3.Bytes()
+	preauth = sha512Parts(preauth[:], ss3Bytes) // ss_resp3 is NOT hashed
+
+	tx = NewWriter(0)
+	ProcessFrame(srv, pc, ss3Bytes, tx)
+	out := tx.Bytes()
+	if st := le32(out[12:16]); st != StatusSuccess {
+		t.Fatalf("session setup status %#x", st)
+	}
+	// The server must have told the client to seal. tx carries the 4-byte NBT
+	// prefix, then the 64-byte header, then the SESSION_SETUP body.
+	body := out[4+64:]
+	if flags := le16(body[2:4]); flags&sessionFlagEncryptData == 0 {
+		t.Fatalf("SESSION_FLAG_ENCRYPT_DATA must be set, flags = %#x", flags)
+	}
+
+	// --- a plaintext request on an encryption-required session is refused ---
+	echo := reqHdr(CmdEcho, 3, 0, sess)
+	echo.U16(4)
+	echo.U16(0)
+	tx = NewWriter(0)
+	if act, _ := ProcessFrame(srv, pc, echo.Bytes(), tx); act != actionRespond {
+		t.Fatal("the refusal must be a response")
+	}
+	if st := le32(tx.Bytes()[12:16]); st != StatusAccessDenied {
+		t.Fatalf("plaintext request status %#x, want ACCESS_DENIED", st)
+	}
+
+	// --- the same request, sealed with the client's own c2s key, is served ---
+	// Both sides derive the same key pair from the session key + preauth.
+	c2s, s2c := smb311EncryptionKeys(CipherAES128GCM, &sessionKey, &preauth)
+	client := &EncCtx{Cipher: CipherAES128GCM, C2S: s2c, S2C: c2s}
+	echoSealed := reqHdr(CmdEcho, 4, 0, sess)
+	echoSealed.U16(4)
+	echoSealed.U16(0)
+	sealed := NewWriter(0)
+	wrapTransformAppend(echoSealed.Bytes(), client, sess, sealed)
+
+	tx = NewWriter(0)
+	if act, _ := ProcessFrame(srv, pc, sealed.Bytes()[4:], tx); act != actionRespond {
+		t.Fatal("the sealed request must be answered")
+	}
+	resp := tx.Bytes()
+	if len(resp) < 4 {
+		t.Fatal("no response to the sealed request")
+	}
+	if !isTransform(resp[4:]) {
+		t.Fatalf("the response to a sealed request must itself be sealed")
+	}
+	plain, ok := decryptTransform(resp[4:], client)
+	if !ok {
+		t.Fatal("the sealed response must decrypt with the s2c key")
+	}
+	if st := le32(plain[8:12]); st != StatusSuccess {
+		t.Fatalf("sealed echo status %#x", st)
+	}
+	if cmd := le16(plain[12:14]); cmd != CmdEcho {
+		t.Fatalf("sealed response command = %d", cmd)
+	}
+}

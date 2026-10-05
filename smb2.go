@@ -1,6 +1,9 @@
 package samba
 
-import "os"
+import (
+	"os"
+	"strconv"
+)
 
 // SMB2 core: header codec, compound dispatch, connection protocol state.
 //
@@ -336,6 +339,50 @@ type Chain struct {
 	TreeID    uint32
 	LastFID   *uint64
 	Single    bool
+}
+
+// cmdName names an SMB2 command for logs.
+func cmdName(cmd uint16) string {
+	switch cmd {
+	case CmdNegotiate:
+		return "NEGOTIATE"
+	case CmdSessionSetup:
+		return "SESSION_SETUP"
+	case CmdLogoff:
+		return "LOGOFF"
+	case CmdTreeConnect:
+		return "TREE_CONNECT"
+	case CmdTreeDisconnect:
+		return "TREE_DISCONNECT"
+	case CmdCreate:
+		return "CREATE"
+	case CmdClose:
+		return "CLOSE"
+	case CmdFlush:
+		return "FLUSH"
+	case CmdRead:
+		return "READ"
+	case CmdWrite:
+		return "WRITE"
+	case CmdLock:
+		return "LOCK"
+	case CmdIoctl:
+		return "IOCTL"
+	case CmdCancel:
+		return "CANCEL"
+	case CmdEcho:
+		return "ECHO"
+	case CmdQueryDirectory:
+		return "QUERY_DIRECTORY"
+	case CmdChangeNotify:
+		return "CHANGE_NOTIFY"
+	case CmdQueryInfo:
+		return "QUERY_INFO"
+	case CmdSetInfo:
+		return "SET_INFO"
+	default:
+		return "command " + strconv.FormatUint(uint64(cmd), 10)
+	}
 }
 
 // beginResp writes a response header and returns the offset of the header start
@@ -738,7 +785,7 @@ func processPlain(srv *Srv, pc *ProtoConn, frame []byte, tx *Writer, encrypted b
 			tx.Patch32(prevStart+20, uint32(here-prevStart))
 		}
 		respStart := tx.Len()
-		if z := dispatch(srv, pc, &h, msg, chain, tx); z != nil {
+		if z := dispatch(srv, pc, &h, msg, chain, tx, encrypted); z != nil {
 			plan = z
 		}
 		if tx.Len() > respStart {

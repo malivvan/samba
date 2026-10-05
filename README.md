@@ -54,6 +54,11 @@ Two suites measure the server, and both are in this repository:
   parallel read, small-file metadata and integrity, and it can be pointed at a
   Samba instance for a like-for-like comparison. Requires root, port 445 and
   `cifs-utils`.
+- **`bench/interop-smbclient.sh`** — drives a running server with Samba's own
+  `smbclient` (no root needed) across the dialect matrix, md5-verified
+  transfers, authentication and SMB3 encryption. This is the interop gate: it
+  currently passes 13/13, and it is how several pipelining and encryption bugs
+  were caught.
 
 Measured on an Intel Core i7-8550U (4 cores / 8 threads), Linux 7.0, loopback,
 one worker, with the benchmark client in the same process and one request in

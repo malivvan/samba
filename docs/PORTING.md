@@ -137,7 +137,30 @@ Everything below is a conscious change, not an accident of translation.
    Here the handle is an `*os.File` and reads use `ReadAt`, which is
    position-independent, so no duplication is needed and concurrent reads on
    different channels are safe by construction.
-7. **Small things**: `statusFromErr(nil)` is success; `MaxReadSize` is the
+7. **An encryption-required session refuses unsealed requests.** The server
+   advertises `SESSION_FLAG_ENCRYPT_DATA` to tell a client to seal, and the
+   original then processed a plaintext request anyway. Here, once a session
+   requires encryption (`encrypt = true`) or a client has started sealing, a
+   request that arrives unsealed is answered with `STATUS_ACCESS_DENIED`
+   instead of being served in the clear — otherwise an attacker could strip
+   sealing from the session, which is exactly what SMB3 encryption is for. A
+   request that arrived inside a transform header is exempt (it *is* sealed),
+   as are NEGOTIATE, SESSION_SETUP and CANCEL.
+8. **The NTLMSSP challenge echoes `NEGOTIATE_SEAL` when the client asks for
+   it.** The original's fixed challenge flags omitted the bit, which makes
+   Samba's client refuse to turn on encryption at all
+   (`HRES_SEC_E_UNSUPPORTED_FUNCTION` during SPNEGO login). Echoing a capability
+   the client requested does not weaken anything — SMB3 encryption is activated
+   by the SMB-layer negotiation, not by this flag — and it is what makes
+   `smbclient --client-protection=encrypt` work.
+9. **Directory search patterns are matched as patterns.** `QUERY_DIRECTORY`
+   carries a search pattern that the *server* is expected to apply, and the
+   original compared it to each entry for equality. That answers
+   `STATUS_NO_SUCH_FILE` for every realistic wildcard query — `smbclient`'s
+   `ls *.txt`, Explorer filtering, `del *` — so `pattern.go` implements DOS
+   wildcard matching (`?`, `*`, case-insensitive, with `*` crossing the dot and
+   an insignificant trailing dot) instead. Exact-name queries behave as before.
+10. **Small things**: `statusFromErr(nil)` is success; `MaxReadSize` is the
    1 MiB target directly rather than a value probed from the pipe ceiling (the
    pipe is sized opportunistically instead); the pipe wait uses a bounded
    `poll(2)` timeout so a stalled peer cannot delay shutdown.

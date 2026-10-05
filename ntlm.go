@@ -14,7 +14,12 @@ var ntlmSig = []byte("NTLMSSP\x00")
 
 const (
 	ntlmFlagAnonymous uint32 = 0x0000_0800
-	ntlmFlagKeyExch   uint32 = 0x4000_0000
+	// ntlmFlagSeal is NTLMSSP_NEGOTIATE_SEAL. It is only echoed back when the
+	// client asks for it: Samba's client requires the echo before it will
+	// enable SMB3 encryption (client protection = encrypt), while cifs.ko and
+	// Windows enable encryption from the SMB-layer negotiation alone.
+	ntlmFlagSeal    uint32 = 0x0000_0020
+	ntlmFlagKeyExch uint32 = 0x4000_0000
 )
 
 // TokenKind classifies an NTLMSSP message.
@@ -86,8 +91,22 @@ const ntlmFlags uint32 = 0x0000_0001 | // UNICODE
 	0x4000_0000 | // KEY_EXCH
 	0x8000_0000 // 56-bit
 
-// ntlmChallenge builds a CHALLENGE_MESSAGE (type 2).
-func ntlmChallenge(serverName string, chal [8]byte) []byte {
+// ntlmNegotiateFlags reads the NegotiateFlags field of a NEGOTIATE_MESSAGE
+// (type 1), or reports 0 when the blob does not carry one.
+func ntlmNegotiateFlags(blob []byte) uint32 {
+	tok := findToken(blob)
+	// Signature(8) + MessageType(4) + NegotiateFlags(4).
+	const flagsOff = 12
+	if len(tok) < flagsOff+4 || le32(tok[8:12]) != 1 {
+		return 0
+	}
+	return le32(tok[flagsOff : flagsOff+4])
+}
+
+// ntlmChallenge builds a CHALLENGE_MESSAGE (type 2). clientFlags is the
+// NegotiateFlags the client sent, so the server can echo the capabilities it
+// honours (currently NEGOTIATE_SEAL).
+func ntlmChallenge(serverName string, chal [8]byte, clientFlags uint32) []byte {
 	target := UTF16LE(serverName)
 	info := NewWriter(64)
 	// AV pairs: NetBIOS domain (2), NetBIOS computer (1), EOL (0).
@@ -106,7 +125,11 @@ func ntlmChallenge(serverName string, chal [8]byte) []byte {
 	w.U16(uint16(len(target)))
 	w.U16(uint16(len(target)))
 	w.U32(hdr)
-	w.U32(ntlmFlags)
+	flags := ntlmFlags
+	if clientFlags&ntlmFlagSeal != 0 {
+		flags |= ntlmFlagSeal
+	}
+	w.U32(flags)
 	w.Bytes8(chal[:])
 	w.U64(0) // Reserved
 	w.U16(uint16(info.Len()))

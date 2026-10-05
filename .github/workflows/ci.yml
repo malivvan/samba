@@ -44,6 +44,26 @@ jobs:
             go test -run '^$' -fuzz "^${t}$" -fuzztime 10s .
           done
 
+  interop:
+    # Drive the built server with Samba's own client: the dialect matrix, file
+    # operations, authentication and SMB3 encryption. This is the closest thing
+    # to a real deployment that can run in CI, and it is where pipelining and
+    # encryption bugs were caught.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install smbclient
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y smbclient
+      - name: SMB client interop
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o ./samba ./cmd/samba
+          ./bench/interop-smbclient.sh ./samba
+
   cross-check:
     runs-on: ubuntu-latest
     steps:
