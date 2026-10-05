@@ -160,7 +160,7 @@ degradation where it is not, never a fallback that pretends.
 |---|---|---|---|---|---|---|---|
 | Shared listening port | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ✓ `SO_REUSEPORT` | ~ one shared listener ⁽¹⁾ |
 | Directory change notification | ✓ `inotify` | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `kqueue` ⁽²⁾ | ✓ `ReadDirectoryChangesW` ⁽³⁾ |
-| Byte-range locking | ✓ OFD locks ⁽⁴⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ✓ `LockFileEx` ⁽⁴⁾ |
+| Byte-range locking | ✓ OFD locks ⁽⁴⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ~ in-process ⁽⁵⁾ | ✓ `LockFileEx` ⁽⁴⁾⁽¹¹⁾ |
 | File → socket | ✓ `splice(2)` | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ✓ `sendfile(2)` ⁽¹⁰⁾ | ~ buffered copy ⁽⁶⁾ |
 | File metadata | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `stat(2)` | ✓ `GetFileInformationByHandle` ⁽⁷⁾ |
 | Timestamps | ✓ `utimensat(2)`, ns | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `futimes(2)`, µs ⁽⁸⁾ | ✓ `SetFileTime`, 100 ns |
@@ -228,7 +228,8 @@ these are the consequences worth knowing before deploying:
   `CHANGE_NOTIFY`, so the case does not hang.
 - ⁽⁴⁾ **Linux and Windows enforce a lock against other local processes too** —
   the kernel's lock is taken on top of the server's own table, so a local process
-  writing to a share file sees it.
+  writing to a share file sees it. On Windows that mirror costs an extra step in
+  every change; see ⁽¹¹⁾.
 - ⁽⁵⁾ **macOS and the BSDs do not enforce a lock against local processes.** They
   have only classic POSIX record locks, which belong to the *process*: two
   handles of one file never conflict at the kernel, and closing any descriptor
@@ -274,6 +275,32 @@ these are the consequences worth knowing before deploying:
   allocates mbufs before it checks the non-blocking flag, so under mbuf pressure
   the call can park inside the kernel and the stall deadline cannot preempt it —
   it resumes once the allocation succeeds.
+- ⁽¹¹⁾ **Windows locks are exact-match objects, and the server works around it.**
+  A Windows byte-range lock can only be released with exactly the range it was
+  taken with — no partial unlock, no release of two adjacent locks with one call
+  — and a handle cannot take a range it already holds, so a shared lock cannot be
+  upgraded in place and a client cannot re-lock what it holds (both are refused
+  even for the same handle). A range whose offset plus length runs past the
+  largest signed offset is refused outright. POSIX locks, and the protocol's own
+  semantics, allow all of those.
+  So on Windows the kernel's table is not updated in place: for each change the
+  server computes the region affected, releases exactly the objects it took there,
+  and takes exactly the ranges the registry wants in their place. Two consequences
+  are worth knowing:
+  - The *protocol* result is identical to every other platform — the registry
+    decides what a client may lock, and it splits, merges and converts freely.
+  - Because the kernel objects are rebuilt, another process touching the file can
+    win a race for a range in the middle of a change. That makes the operation
+    fail with `LOCK_NOT_GRANTED` (the client can retry), and if the range cannot
+    be put back, that handle's locks stop being mirrored into the kernel — so they
+    are enforced between SMB clients, which is the protocol's guarantee, but no
+    longer against other local processes. `samba --list-platform` counts those
+    events. Linux has no such window: its OFD locks are updated in place.
+  - Windows also enforces a byte-range lock against *I/O* through other handles,
+    so a WRITE from a second client to a range the first has locked fails with an
+    I/O error. That is how Windows behaves, and a client of a Windows-hosted
+    server sees it elsewhere too; on Linux such a write succeeds, because POSIX
+    locks are advisory.
 - **Creation time is synthesized from the modification time** on every platform:
   SMB has a creation time and no portable way to read one, so `mtime` is
   reported. Live with it or fix it per platform — it is not a platform

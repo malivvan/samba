@@ -33,10 +33,24 @@ resource limits and the panic guards are one Go codebase everywhere.
   cancel that races an event, and makes `TestServerChangeNotify` deterministic
   instead of relying on the notifier being scheduled in time.
 - **`pkg/rangelock`** — an in-process registry that is authoritative for SMB's
-  per-handle semantics on every platform, with the kernel's own lock on top
-  where the platform has a per-handle kind (OFD locks on Linux, `LockFileEx` on
+  per-handle semantics on every platform, with the kernel's own lock on top where
+  the platform has a per-handle kind (OFD locks on Linux, `LockFileEx` on
   Windows). macOS and the BSDs have only process-scoped POSIX locks, which would
   be actively wrong here, so they do not take one.
+- **Windows locks are exact-match objects, so its kernel table is rebuilt rather
+  than nudged.** A Windows lock can only be released with the range it was taken
+  with (no partial unlock, no releasing two adjacent locks at once), and a handle
+  may not take a range it already holds (so no in-place upgrade, and no re-locking
+  what it holds) — while SMB requires both, and a range past the largest signed
+  offset is refused outright. `planMirror` computes, for each change, the region
+  affected and therefore exactly which of the handle's objects must be released
+  and which ranges taken in their place; it is plain arithmetic over ranges, so it
+  is tested on every platform rather than only on Windows. A range is now also
+  expressed with a length that cannot overflow, which is what a "to the end of the
+  file" lock needs there. A process outside the server that wins a race for a
+  range mid-change makes the operation report `LOCK_NOT_GRANTED`, and if the range
+  cannot be put back that handle's locks stop being mirrored — counted, and
+  reported by `--list-platform`, so the degradation is visible.
 - **`pkg/zerocopy`** — `splice(2)` on Linux, `sendfile(2)` on macOS and the
   BSDs, a bounded buffered copy on Windows, plus a fallback to the buffered path
   when a host filters the syscall (a seccomp container) — counted, so the

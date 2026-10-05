@@ -27,3 +27,20 @@ const backend = "in-process"
 // not against a local process writing to the same file, so a share must not be
 // used both locally and over SMB.
 func kernelLock(*os.File, int64, int64, Kind) error { return nil }
+
+// kernelUpdate applies one logical change to the kernel's lock table, which on
+// this platform holds nothing: see the note above for why taking a process-scoped
+// lock would be worse than taking none.
+func kernelUpdate(*os.File, []extent, []extent, extent, Kind) error { return nil }
+
+// kernelRelease releases the kernel's records for a handle that is going away.
+// There are none.
+func kernelRelease(*os.File, []extent) {}
+
+// resetKernel forgets every kernel record. There are none.
+func resetKernel() {}
+
+// Degraded reports how many times this process gave up on mirroring a handle's
+// locks into the kernel. It is always zero here: there was never a kernel lock to
+// lose.
+func Degraded() int64 { return 0 }

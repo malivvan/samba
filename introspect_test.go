@@ -353,6 +353,9 @@ func TestPlatformFacilitiesMatchThePackages(t *testing.T) {
 	if want := rangelock.Backend() != "in-process"; locks.Native != want {
 		t.Errorf("locks report native=%v, want %v for backend %q", locks.Native, want, rangelock.Backend())
 	}
+	if locks.Fallbacks != rangelock.Degraded() {
+		t.Errorf("locks report %d degraded handles, the package has %d", locks.Fallbacks, rangelock.Degraded())
+	}
 	if locks.Native && !strings.Contains(lockDetail(), "locks") {
 		t.Errorf("the lock capability detail %q does not name the mechanism", lockDetail())
 	}

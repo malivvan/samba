@@ -391,32 +391,44 @@ func TestBackendsMatchThePlatform(t *testing.T) {
 	}
 }
 
-// TestKernelLockingFollowsTheCapabilityReport checks the cross-process half of
-// the contract: a platform that reports a kernel mechanism must actually take a
-// lock the kernel can see, and one that does not must not pretend.
-func TestKernelLockingFollowsTheCapabilityReport(t *testing.T) {
-	_, a, _ := scratch(t)
+// TestReLockAndUpgradeOnTheSameHandle covers the operations that decided the shape
+// of the kernel layer. A client may re-lock a range it already holds, and may
+// change the mode of a range it holds; POSIX locks do both in place, Windows
+// refuses both, and the answer has to be the same for the client either way.
+func TestReLockAndUpgradeOnTheSameHandle(t *testing.T) {
+	_, a, b := scratch(t)
 	if err := Lock(a, 0, 8, Exclusive, true); err != nil {
 		t.Fatal(err)
 	}
 	defer Release(a)
-	// On Linux and Windows the lock is in the kernel too, so a second *process*
-	// would see it. That cannot be observed from inside this one portably, but
-	// the registry must at least agree with itself.
+
+	// The same range, twice, from the handle that holds it.
 	if err := Lock(a, 0, 8, Exclusive, true); err != nil {
-		t.Fatalf("the same handle must be able to re-lock its own range: %v", err)
+		t.Fatalf("a handle must be able to re-lock its own range: %v", err)
 	}
-	if Backend() == "OFD" {
-		// The kernel half must accept the same range shape the registry uses: an
-		// explicit length, and a zero length meaning "to the end of the file".
-		if err := kernelLock(a, 0, 8, Unlock); err != nil {
-			t.Fatalf("kernel unlock: %v", err)
-		}
-		if err := kernelLock(a, 0, 0, Exclusive); err != nil {
-			t.Fatalf("kernel lock to the end of the file: %v", err)
-		}
-		if err := kernelLock(a, 0, 0, Unlock); err != nil {
-			t.Fatalf("kernel unlock to the end of the file: %v", err)
-		}
+	if err := Lock(a, 0, 8, Shared, true); err != nil {
+		t.Fatalf("a handle must be able to downgrade its own range: %v", err)
+	}
+	// It is shared now, so another handle may share it but not take it alone.
+	if err := Lock(b, 0, 8, Shared, true); err != nil {
+		t.Fatalf("a downgraded range must be shareable: %v", err)
+	}
+	if err := Lock(b, 0, 8, Exclusive, true); !errors.Is(err, ErrNotGranted) {
+		t.Fatalf("exclusive over a shared pair = %v, want ErrNotGranted", err)
+	}
+	// Upgrading it back to exclusive fails while the other handle shares it...
+	if err := Lock(a, 0, 8, Exclusive, true); !errors.Is(err, ErrNotGranted) {
+		t.Fatalf("upgrading over another handle's shared lock = %v, want ErrNotGranted", err)
+	}
+	// ...and succeeds once that handle is gone, on the same handle that holds the
+	// shared lock — which is the in-place conversion Windows does not have.
+	if err := Lock(b, 0, 8, Unlock, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := Lock(a, 0, 8, Exclusive, true); err != nil {
+		t.Fatalf("upgrade after the other handle released: %v", err)
+	}
+	if err := Lock(b, 0, 8, Shared, true); !errors.Is(err, ErrNotGranted) {
+		t.Fatalf("the upgraded range = %v, want ErrNotGranted", err)
 	}
 }

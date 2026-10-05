@@ -144,10 +144,12 @@ type Facility struct {
 	// value is a documented degradation, not a failure: the server works, with
 	// the consequence stated in the Detail and in the README support table.
 	Native bool
-	// Fallbacks counts transfers that took a fallback path at runtime, where the
-	// server can count them (zero-length reads are not counted). It is the same
-	// number `samba --check` prints, and it is how an operator notices that the
-	// fast path is not being taken.
+	// Fallbacks counts runtime events that left the mechanism degraded: a transfer
+	// that took the buffered copy on a platform whose kernel path was filtered, or
+	// (on Windows) a handle whose locks had to stop being mirrored into the kernel
+	// after another process raced the re-lock. It is the number `samba --check`
+	// prints, and it is how an operator notices that less is being enforced than
+	// the platform can do.
 	Fallbacks int64
 }
 
@@ -173,9 +175,10 @@ func PlatformFacilities() []Facility {
 			Native: watch.Supported(),
 		},
 		{
-			Name:   "platform locks",
-			Detail: rangelock.Backend(),
-			Native: rangelock.Backend() != "in-process",
+			Name:      "platform locks",
+			Detail:    rangelock.Backend(),
+			Native:    rangelock.Backend() != "in-process",
+			Fallbacks: rangelock.Degraded(),
 		},
 		{
 			Name:      "platform copy",
@@ -274,7 +277,7 @@ func lockDetail() string {
 	case "OFD":
 		return "open-file-description locks, all-or-nothing batches"
 	case "LockFileEx":
-		return "LockFileEx locks, all-or-nothing batches"
+		return "LockFileEx locks rebuilt per change, all-or-nothing batches"
 	default:
 		return "in-process locks, all-or-nothing batches; not enforced against local processes"
 	}

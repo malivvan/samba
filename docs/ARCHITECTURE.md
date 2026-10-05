@@ -114,9 +114,20 @@ platforms that have none:
 |---|---|---|
 | `pkg/reuseport` | `Listeners(n, network, addr)` → the sockets the workers share | `SO_REUSEPORT`, or one shared socket |
 | `pkg/watch` | `Add`/`Remove`/`Events`: one ID per watched directory, batched notifications | inotify, kqueue, ReadDirectoryChangesW, polling |
-| `pkg/rangelock` | `Lock(f, off, len, kind, writeAccess)` | the in-process registry, plus OFD locks or `LockFileEx` where they exist |
+| `pkg/rangelock` | `Lock(f, off, len, kind, writeAccess)` | the in-process registry, plus OFD locks or `LockFileEx` where they exist ⁽*⁾ |
 | `pkg/zerocopy` | `Send(conn, file, off, n, stall)` | `splice(2)`, `sendfile(2)`, buffered copy |
 | `pkg/fsutil` | file metadata, timestamps, filesystem sizes, open flags | the platform's own calls, or `ErrUnsupported` |
+
+⁽*⁾ The registry is authoritative for what an SMB client may lock, on every
+platform, because SMB's semantics (a range is split by a partial unlock, merged
+with its neighbours, converted in place, and never conflicts with itself) are
+POSIX's, not every kernel's. Where a kernel offers per-handle locks the same change
+is *also* applied to it, so a local process sees it too — but the two tables are
+not always updated the same way. Linux's OFD locks take the change directly;
+Windows' are exact-match objects that can neither be unlocked in part nor taken
+twice by one handle, so `planMirror` computes the affected region and the platform
+layer releases and re-takes the objects in it. That arithmetic is portable and
+tested everywhere; only the two syscalls are per-platform.
 
 The boundary is drawn deliberately: **nothing above this layer knows which
 platform it is on.** There are no build tags outside `pkg/`, the protocol code

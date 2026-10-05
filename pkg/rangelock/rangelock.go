@@ -119,6 +119,9 @@ func (r extent) overlaps(o extent) bool { return r.start <= o.end && o.start <= 
 // extends reports whether r ends after o ends.
 func (r extent) extends(o extent) bool { return r.end > o.end }
 
+// contains reports whether r covers all of o.
+func (r extent) contains(o extent) bool { return r.start <= o.start && o.end <= r.end }
+
 // kernelRange converts a range into the (offset, length) pair the kernel wants.
 //
 // A length of zero means "to the end of the file" to the kernel, which is how a
@@ -127,7 +130,7 @@ func (r extent) extends(o extent) bool { return r.end > o.end }
 // largest signed offset the kernel can be given cannot be, and that range is then
 // kept in the registry alone.
 func kernelRange(r extent) (start int64, length int64, ok bool) {
-	if r.start > math.MaxInt64 {
+	if !expressibleForKernel(r) {
 		return 0, 0, false
 	}
 	if r.end >= toEnd {
@@ -135,6 +138,14 @@ func kernelRange(r extent) (start int64, length int64, ok bool) {
 	}
 	return int64(r.start), int64(r.end-r.start) + 1, true
 }
+
+// expressibleForKernel reports whether a range can be named to a kernel at all.
+//
+// A kernel lock is addressed with a signed offset, so a range starting beyond the
+// largest one cannot be expressed and is kept in the registry alone — the protocol
+// still holds it (the registry is authoritative for what SMB clients see), it is
+// simply not enforced against other processes on the host.
+func expressibleForKernel(r extent) bool { return r.start <= math.MaxInt64 }
 
 // fileKey identifies a file the way the filesystem does. Locks are per file, so
 // two handles that reach the same inode through different names or shares must
@@ -176,35 +187,41 @@ var global = &registry{
 	owners: make(map[uintptr]map[fileKey]struct{}),
 }
 
-// apply records a change to the registry under the registry lock, running
-// kernel inside that same critical section.
+// apply records a change to the registry under the registry lock, updating the
+// kernel's own table inside that same critical section.
 //
-// Holding the lock across the kernel call is deliberate: the registry and the
-// kernel's view must agree, and doing so is safe because every kernel lock here
-// is taken with the non-waiting variant, so the call cannot block. The change is
-// only recorded once the kernel has agreed to it, which is what stops a failed
-// kernel lock from leaving a phantom range behind.
-func (r *registry) apply(key fileKey, owner uintptr, want extent, unlock bool, kernel func() error) error {
+// Holding the lock across the kernel calls is deliberate: the registry and the
+// kernel's view must agree, and doing so is safe because every kernel lock here is
+// taken with the non-waiting variant, so a call cannot block. The change is only
+// recorded once the kernel has agreed to it, which is what stops a failed kernel
+// lock from leaving a phantom range behind.
+//
+// The kernel's table is updated on every change, including one that leaves the
+// handle's ranges as they were: a client may re-lock a range it already holds and
+// may change its mode, and on Windows neither request can be expressed the way
+// POSIX expresses it. The platform layer rebuilds the affected region instead, so
+// the same request is answered the same way on both.
+func (r *registry) apply(key fileKey, owner uintptr, want extent, kind Kind, f *os.File) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	mine := r.files[key][owner]
 	var next []extent
-	if unlock {
+	if kind == Unlock {
 		next = subtract(mine, want)
 	} else {
 		if err := r.conflicts(key, owner, want); err != nil {
 			return err
 		}
-		// Re-locking a range the same handle already holds replaces whatever it
-		// held there, which is what both POSIX and Windows do: a lock request
-		// that overlaps an existing lock of the same owner overwrites it.
+		// A lock request that overlaps an existing lock of the same owner
+		// overwrites it, which is what POSIX and SMB both say, so the new range is
+		// carved out of whatever covered it and the result coalesced.
 		next = coalesce(append(subtract(mine, want), want))
 	}
 	if len(next) > MaxRangesPerHandle || r.extents-len(mine)+len(next) > MaxRangesTotal {
 		return ErrTooMany
 	}
-	if err := kernel(); err != nil {
+	if err := kernelUpdate(f, mine, next, want, kind); err != nil {
 		return err
 	}
 	r.commit(key, owner, next)
@@ -258,9 +275,9 @@ func (r *registry) commit(key fileKey, owner uintptr, next []extent) {
 	r.owners[owner][key] = struct{}{}
 }
 
-// release drops every range held by a handle, calling kernel for each so the
-// platform can release its own record of it. It is called when an SMB handle
-// closes, because that is when the protocol says its locks are released.
+// release drops every range held by a handle, releasing the kernel's own records
+// of them first. It is called when an SMB handle closes, because that is when the
+// protocol says its locks are released.
 //
 // The kernel half matters even though the descriptor is about to close: an
 // open-file-description lock (Linux) or a LockFileEx lock (Windows) is held by
@@ -269,14 +286,12 @@ func (r *registry) commit(key fileKey, owner uintptr, next []extent) {
 // keeps open. Doing it explicitly also makes the behaviour identical on the
 // platforms where the registry is the only table and nothing else would release
 // anything.
-func (r *registry) release(owner uintptr, kernel func(extent)) {
+func (r *registry) release(owner uintptr, f *os.File) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for key := range r.owners[owner] {
 		byOwner := r.files[key]
-		for _, e := range byOwner[owner] {
-			kernel(e)
-		}
+		kernelRelease(f, byOwner[owner])
 		r.extents -= len(byOwner[owner])
 		delete(byOwner, owner)
 		if len(byOwner) == 0 {
@@ -357,27 +372,7 @@ func Lock(f *os.File, off, length uint64, kind Kind, writeAccess bool) error {
 	owner := f.Fd()
 	want := normalizeRange(off, length)
 	want.exclusive = kind == Exclusive
-	unlock := kind == Unlock
-	return global.apply(key, owner, want, unlock, func() error {
-		start, kernelLen, ok := kernelRange(want)
-		if !ok {
-			// Beyond the largest offset a kernel lock can name. The registry is
-			// authoritative for the protocol, so the range is simply not mirrored
-			// into the kernel's table.
-			return nil
-		}
-		err := kernelLock(f, start, kernelLen, kind)
-		// A conflict is reported to the caller as one error, whichever table
-		// noticed it: the kernel says "resource temporarily unavailable" or
-		// "permission denied" for a range another process holds, and the registry
-		// says ErrNotGranted for one another handle of this server holds. They
-		// mean the same thing to a client. Which errno to look for is the
-		// platform's business (see isConflict).
-		if isConflict(err) {
-			return ErrNotGranted
-		}
-		return err
-	})
+	return global.apply(key, owner, want, kind, f)
 }
 
 // Release drops every lock held through f and the kernel's own records of them.
@@ -389,12 +384,7 @@ func Release(f *os.File) {
 	if f == nil {
 		return
 	}
-	global.release(f.Fd(), func(e extent) {
-		start, length, ok := kernelRange(e)
-		if ok {
-			_ = kernelLock(f, start, length, Unlock)
-		}
-	})
+	global.release(f.Fd(), f)
 }
 
 // ReleaseAll drops every lock the server holds. It exists for tests and for a
@@ -402,6 +392,7 @@ func Release(f *os.File) {
 func ReleaseAll() {
 	global.mu.Lock()
 	defer global.mu.Unlock()
+	resetKernel()
 	global.files = make(map[fileKey]map[uintptr][]extent)
 	global.owners = make(map[uintptr]map[fileKey]struct{})
 	global.extents = 0
